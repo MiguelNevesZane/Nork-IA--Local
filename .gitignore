@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Ambientes virtuais
+venv_cuda/
+venv/
+.venv/
+env/
+
+# Banco de memória (dados locais, não vai para o repo)
+memoria_db/
+
+# Histórico de conversa (dado de sessão local)
+memoria_chat.json
+
+# Checkpoints de fine-tuning
+llm_finetuned/
+
+# Logs e dados temporários
+*.log
+sessao_chat.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

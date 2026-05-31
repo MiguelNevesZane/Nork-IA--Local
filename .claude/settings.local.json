@@ -39,7 +39,8 @@
       "PowerShell(python -c \"import requests; print\\('requests OK:', requests.__version__\\)\" 2>&1)",
       "PowerShell(Get-Command *)",
       "Bash(Get-ChildItem -Recurse -Force)",
-      "Bash(Select-Object FullName)"
+      "Bash(Select-Object FullName)",
+      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $content = Get-Content README.md -Raw -Encoding Unicode; [System.IO.File]::WriteAllText\\(\"$PWD\\\\README.md\", $content, [System.Text.Encoding]::UTF8\\); Write-Host \"Encoding corrigido\")"
     ]
   }
 }
