@@ -40,7 +40,25 @@
       "PowerShell(Get-Command *)",
       "Bash(Get-ChildItem -Recurse -Force)",
       "Bash(Select-Object FullName)",
-      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $content = Get-Content README.md -Raw -Encoding Unicode; [System.IO.File]::WriteAllText\\(\"$PWD\\\\README.md\", $content, [System.Text.Encoding]::UTF8\\); Write-Host \"Encoding corrigido\")"
+      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $content = Get-Content README.md -Raw -Encoding Unicode; [System.IO.File]::WriteAllText\\(\"$PWD\\\\README.md\", $content, [System.Text.Encoding]::UTF8\\); Write-Host \"Encoding corrigido\")",
+      "Bash(ollama --version)",
+      "Bash(python --version)",
+      "PowerShell(ollama *)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\" -File | Where-Object { $_.Extension -in \".py\", \".bat\", \".txt\", \".md\", \".json\", \".cfg\", \".toml\" } | Select-Object Name, Length | Format-Table -AutoSize)",
+      "PowerShell($paths = @\\(\"C:\\\\Users\\\\Miguel.N.Zane\\\\AppData\\\\Local\\\\Programs\\\\Ollama\\\\ollama.exe\", \"C:\\\\Program Files\\\\Ollama\\\\ollama.exe\", \"$env:LOCALAPPDATA\\\\Ollama\\\\ollama.exe\"\\); foreach \\($p in $paths\\) { if \\(Test-Path $p\\) { Write-Output \"Found: $p\"; & $p --version } }; $cmd = Get-Command ollama -ErrorAction SilentlyContinue; if \\($cmd\\) { $cmd.Source })",
+      "PowerShell(head *)",
+      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $env:PYTHONIOENCODING=\"utf-8\"; & \".\\\\venv_cuda\\\\Scripts\\\\python.exe\" testes.py 2>&1)",
+      "PowerShell(cd *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "PowerShell([System.Environment]::SetEnvironmentVariable\\(\"PATH\", $env:PATH + \";$env:LOCALAPPDATA\\\\Programs\\\\Ollama\", \"User\"\\); Write-Output \"PATH atualizado permanentemente para o usuario.\")",
+      "PowerShell(ollama pull *)",
+      "PowerShell(ollama list *)",
+      "PowerShell($env:PATH += \";$env:LOCALAPPDATA\\\\Programs\\\\Ollama\"; Start-Process -FilePath \"ollama\" -ArgumentList \"serve\" -WindowStyle Hidden; Start-Sleep -Seconds 3; try { $r = Invoke-RestMethod \"http://localhost:11434/api/tags\" -TimeoutSec 5; Write-Output \"Ollama rodando. Modelos: $\\(\\($r.models | ForEach-Object {$_.name}\\) -join ', '\\)\" } catch { Write-Output \"Aguardando Ollama inicializar...\" })",
+      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $env:PATH += \";$env:LOCALAPPDATA\\\\Programs\\\\Ollama\"; $env:PYTHONIOENCODING = \"utf-8\"; \"sair\" | & \".\\\\venv_cuda\\\\Scripts\\\\python.exe\" main.py 2>&1)",
+      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $env:PYTHONIOENCODING=\"utf-8\"; & \".\\\\venv_cuda\\\\Scripts\\\\python.exe\" testes.py 2>&1 | Select-String -Pattern \"OK|FALHA|Resultado\")",
+      "PowerShell(cd \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\"; $env:PYTHONIOENCODING=\"utf-8\"; & \".\\\\venv_cuda\\\\Scripts\\\\python.exe\" testes.py 2>&1 | Select-String -Pattern \"FALHA|Resultado\")"
     ]
   }
 }
