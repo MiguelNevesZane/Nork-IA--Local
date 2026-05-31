@@ -13,9 +13,14 @@ Modos:
     7. Compacto           — respostas curtas e diretas
     8. Ultra-pensamento   — 30 etapas + 2ª perspectiva + síntese
 
+Memória semântica (banco_memoria.py):
+    - Detecta fatos relevantes na conversa e salva automaticamente
+    - Recupera com bi-encoder + rerank antes de cada resposta
+    - Comandos: 'banco' | 'memorias' | 'salvar <texto>' | 'esquecer <id>'
+
 Dependências:
     pip install requests
-    pip install chromadb sentence-transformers   (opcional, apenas modo 5)
+    pip install chromadb sentence-transformers   (banco de memória + RAG)
 """
 
 import json
@@ -29,6 +34,8 @@ from collections import Counter
 from pathlib import Path
 
 import requests
+
+from banco_memoria import BancoMemoria
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
@@ -616,40 +623,243 @@ def _atualizar_perfil(pergunta: str, memoria: Memoria):
         memoria.atualizar_perfil("preferencias", f"{prefs}; {pergunta}".strip("; "))
 
 # ─────────────────────────────────────────────────────────────
+# INTEGRAÇÃO COM BANCO DE MEMÓRIA
+# ─────────────────────────────────────────────────────────────
+
+SYSTEM_EXTRACAO = """Você extrai fatos sobre o usuário de uma conversa.
+Responda APENAS com JSON válido. Sem explicação. Sem markdown.
+Formato: {"fatos": ["fato 1", "fato 2"]}
+Se não há fatos relevantes: {"fatos": []}"""
+
+
+def _injetar_memorias(mensagens: list[dict], banco: BancoMemoria) -> list[dict]:
+    """
+    Recupera memórias relevantes do banco (bi-encoder + rerank) e
+    as injeta como mensagem de sistema antes da pergunta do usuário.
+    O histórico de roles user/assistant não é alterado.
+    """
+    if not banco.disponivel:
+        return mensagens
+
+    query    = mensagens[-1]["content"]
+    contexto = banco.formatar_contexto(query)
+
+    if not contexto:
+        return mensagens
+
+    # Injeta como mensagem de sistema logo antes da pergunta atual
+    injetada = {"role": "system", "content": contexto}
+    return mensagens[:-1] + [injetada, mensagens[-1]]
+
+
+def _extrair_e_salvar(pergunta: str, resposta: str, banco: BancoMemoria):
+    """
+    Chama o modelo para extrair fatos relevantes da troca e salva no banco.
+    Só executa se a heurística detectar potencial de fato salvável.
+    """
+    if not banco.disponivel:
+        return
+    if not BancoMemoria.deve_salvar(pergunta):
+        return
+
+    prompt_ext = BancoMemoria.prompt_extracao(pergunta, resposta)
+    msgs_ext   = [{"role": "user", "content": prompt_ext}]
+
+    try:
+        bruto  = _chamar_ollama(msgs_ext, SYSTEM_EXTRACAO, temperature=0.0)
+        fatos  = BancoMemoria.parse_fatos(bruto)
+        salvos = []
+        for fato in fatos:
+            doc_id = banco.adicionar(fato, fonte="auto")
+            if doc_id:
+                salvos.append(fato)
+        if salvos:
+            print(f"\n  [Banco] {len(salvos)} fato(s) salvo(s) automaticamente:")
+            for f in salvos:
+                print(f"    > {f}")
+    except Exception:
+        pass   # falha silenciosa — não interrompe a conversa
+
+
+# ─────────────────────────────────────────────────────────────
 # INTERFACE DE CHAT
 # ─────────────────────────────────────────────────────────────
 
 MODOS = {
-    "1": ("CoT profundo",        "30 etapas de raciocínio antes da resposta"),
-    "2": ("Codigo + few-shot",   "gera código Python com exemplos de referência"),
-    "3": ("Codigo + verif.",     "gera, executa e autocorrige o código"),
-    "4": ("Self-consistency",    "3 respostas independentes, vota na melhor"),
-    "5": ("RAG local",           "usa documentos da pasta ./docs/"),
-    "6": ("Adaptativo",          "aprende e adapta ao seu perfil de comunicação"),
-    "7": ("Compacto",            "respostas curtas e diretas, sem raciocínio"),
-    "8": ("Ultra-pensamento",    "30 etapas + 2ª perspectiva + síntese"),
+    "1": ("CoT profundo",      "30 etapas de raciocínio"),
+    "2": ("Codigo few-shot",   "Python com exemplos"),
+    "3": ("Codigo + verif.",   "gera, executa, corrige"),
+    "4": ("Self-consistency",  "vota entre 3 respostas"),
+    "5": ("RAG local",         "usa pasta ./docs/"),
+    "6": ("Adaptativo",        "aprende seu perfil"),
+    "7": ("Compacto",          "respostas curtas"),
+    "8": ("Ultra-pensamento",  "30 etapas + síntese"),
 }
 
+# ── Constantes de layout ──────────────────────────────────────
+_CL = 29   # largura do conteúdo coluna esquerda
+_CR = 26   # largura do conteúdo coluna direita
+_TW = _CL + _CR + 5   # largura total interna
 
-def _menu_modo() -> str:
-    print(f"\n+-- Modo de resposta {'─' * 36}")
+def _borda_topo() -> str:
+    return f"+{'='*(_CL+2)}+{'='*(_CR+2)}+"
+
+def _borda_meio() -> str:
+    return f"+{'-'*(_CL+2)}+{'-'*(_CR+2)}+"
+
+def _borda_secao() -> str:
+    return f"+{'='*(_CL+2)}+{'='*(_CR+2)}+"
+
+def _borda_fim() -> str:
+    return f"+{'='*(_CL+2)}+{'='*(_CR+2)}+"
+
+def _linha_colunas(esq: str = "", dir_: str = "") -> str:
+    return f"| {esq:<{_CL}} | {dir_:<{_CR}} |"
+
+def _linha_titulo(titulo: str) -> str:
+    return f"|{titulo.center(_TW)}|"
+
+def _borda_topo_simples() -> str:
+    return f"+{'='*_TW}+"
+
+def _borda_fim_simples() -> str:
+    return f"+{'='*_TW}+"
+
+
+def _exibir_header(modo: str):
+    nome_modo = MODOS[modo][0]
+    print(_borda_topo())
+    print(_linha_titulo(f"  MOTOR IA AVANCADO  |  {MODELO}  "))
+    print(_borda_meio())
+    print(_linha_colunas("  MODOS DE RESPOSTA", "  COMANDOS DE CONVERSA"))
+    print(_borda_meio())
+    cmds_conv = [
+        ("modo",    "trocar modo de resposta"),
+        ("limpar",  "apagar historico da sessao"),
+        ("memoria", "ver historico da sessao"),
+        ("perfil",  "ver perfil detectado"),
+        ("sair",    "encerrar o programa"),
+    ]
+    modos_list = list(MODOS.items())
+    n = max(len(modos_list), len(cmds_conv))
+    for i in range(n):
+        esq = ""
+        if i < len(modos_list):
+            k, (nome, _) = modos_list[i]
+            ativo = " *" if k == modo else "  "
+            esq = f"{ativo}[{k}] {nome}"
+        dir_ = ""
+        if i < len(cmds_conv):
+            cmd, desc = cmds_conv[i]
+            dir_ = f"  {cmd:<9}-> {desc}"
+        print(_linha_colunas(esq, dir_))
+    print(_borda_meio())
+    print(_linha_colunas(f"  Modo ativo: [{modo}] {nome_modo}", "  BANCO DE MEMORIA (linguagem natural)"))
+    print(_borda_meio())
+    banco_cmds = [
+        ("lembra que <texto>",   "salva no banco"),
+        ("o que voce sabe?",     "consulta o banco"),
+        ("esquece tudo",         "limpa o banco"),
+        ("salvar <texto>",       "salva direto"),
+        ("memorias",             "lista registros"),
+        ("esquecer <id>",        "remove registro"),
+        ("banco",                "status do banco"),
+    ]
+    for cmd, desc in banco_cmds:
+        print(_linha_colunas(f"  {cmd}", f"  -> {desc}"))
+    print(_borda_fim())
+    print()
+
+
+def _menu_modo(modo_atual: str) -> str:
+    print()
+    print(_borda_topo_simples())
+    print(_linha_titulo("  ESCOLHA O MODO DE RESPOSTA  "))
+    print(_borda_meio() if False else f"╠{'═'*(_CL+_CR+5)}╣")
     for k, (nome, desc) in MODOS.items():
-        print(f"|  [{k}] {nome:<22} {desc}")
-    print(f"+{'─' * 58}")
-    escolha = input("Modo [1]: ").strip() or "1"
-    return escolha if escolha in MODOS else "1"
+        ativo = " *" if k == modo_atual else "  "
+        linha = f"{ativo}[{k}]  {nome:<18}  {desc}"
+        total = _CL + _CR + 5
+        print(f"║{linha:<{total}}║")
+    print(_borda_fim_simples())
+    escolha = input("  Modo [Enter = manter atual]: ").strip() or modo_atual
+    return escolha if escolha in MODOS else modo_atual
+
+
+# ── Comandos em linguagem natural para o banco ────────────────
+
+_SALVAR_RE = re.compile(
+    r"^(?:lembra(?:r)?|lembre(?:-se)?|guarda(?:r)?|anota(?:r)?|registra(?:r)?)"
+    r"(?:\s+(?:que|isso|disso))?\s*:?\s*(.+)",
+    re.IGNORECASE,
+)
+_LISTAR_RE = re.compile(
+    r"o que (?:voc[eê]|vc) (?:sabe|lembra|tem(?: no banco)?|conhece)(?:\s+sobre\s+(.+))?",
+    re.IGNORECASE,
+)
+_LIMPAR_RE = re.compile(
+    r"^(?:esquece?|limpa?|apaga?)(?:\s+(?:tudo|banco|memorias?|memórias?))(?:\s+(?:do banco|tudo))?$",
+    re.IGNORECASE,
+)
+
+
+def _comando_banco_natural(entrada: str, banco: BancoMemoria) -> bool:
+    """
+    Detecta intenções de controle do banco em linguagem natural.
+    Retorna True se tratou o comando (não enviar ao modelo).
+    Retorna False se é mensagem normal.
+    """
+    txt = entrada.strip()
+
+    # Intenção de salvar: "lembra que X", "guarda que X", etc.
+    m = _SALVAR_RE.match(txt)
+    if m:
+        fato = m.group(1).strip().rstrip(".")
+        if fato:
+            doc_id = banco.adicionar(fato, fonte="natural")
+            print(f"\n  Salvo no banco: '{fato}'")
+            print(f"  ID: {doc_id}\n")
+        return True
+
+    # Intenção de listar / consultar: "o que você sabe sobre X?"
+    m = _LISTAR_RE.search(txt)
+    if m:
+        sobre = (m.group(1) or "").strip().rstrip("?")
+        if sobre:
+            resultados = banco.buscar(sobre)
+            print(f"\n  O que sei sobre '{sobre}':")
+        else:
+            resultados = banco.listar(limite=15)
+            resultados = [{"texto": r["texto"], "meta": r["meta"]} for r in resultados]
+            print(f"\n  Tudo que sei ({banco.total()} registros):")
+        if resultados:
+            for r in resultados:
+                ts = r.get("meta", {}).get("ts", "")
+                print(f"    - {r['texto']}  ({ts})")
+        else:
+            print("    (banco vazio)")
+        print()
+        return True
+
+    # Intenção de limpar banco
+    if _LIMPAR_RE.match(txt):
+        if banco.disponivel and banco._colecao:
+            ids = banco._colecao.get()["ids"]
+            if ids:
+                banco._colecao.delete(ids=ids)
+            print(f"\n  Banco limpo. {len(ids)} registro(s) removido(s).\n")
+        return True
+
+    return False
 
 
 def chat():
-    print("=" * 58)
-    print(f"  Motor IA Avancado  |  Modelo: {MODELO}")
-    print("=" * 58)
-    print("  Comandos: 'modo' | 'limpar' | 'memoria' | 'perfil' | 'sair'")
-    print(f"  Modos: {' | '.join(f'{k}={v[0]}' for k, v in MODOS.items())}\n")
-
     memoria = Memoria()
+    banco   = BancoMemoria()
     rag     = None
     modo    = "1"
+
+    _exibir_header(modo)
 
     while True:
         try:
@@ -661,35 +871,83 @@ def chat():
         if not entrada:
             continue
 
-        match entrada.lower():
-            case "sair":
-                break
-            case "modo":
-                modo = _menu_modo()
-                print(f"  Modo: {MODOS[modo][0]}")
-                continue
-            case "limpar":
-                memoria.limpar()
-                continue
-            case "memoria":
-                msgs = memoria.historico()
-                print(f"\n  -- Historico ({len(msgs)} mensagens) --")
-                for m in msgs:
-                    print(f"  [{m['role']:9}] {m['content'][:100]}")
-                print("  ---")
-                continue
-            case "perfil":
-                print("\n  -- Perfil detectado --")
-                if memoria.perfil:
-                    for k, v in memoria.perfil.items():
-                        print(f"  {k}: {v}")
-                else:
-                    print("  (ainda vazio)")
-                print("  ---")
-                continue
+        cmd = entrada.lower().strip()
 
-        # Monta histórico + nova mensagem para o /api/chat
-        mensagens = memoria.historico() + [{"role": "user", "content": entrada}]
+        # ── Comandos exatos ─────────────────────────────────
+        if cmd == "sair":
+            break
+
+        if cmd == "modo":
+            modo = _menu_modo(modo)
+            _exibir_header(modo)
+            continue
+
+        if cmd == "limpar":
+            memoria.limpar()
+            continue
+
+        if cmd == "memoria":
+            msgs = memoria.historico()
+            print(f"\n  Historico desta sessao ({len(msgs)} msgs):")
+            for m in msgs:
+                print(f"  [{m['role']:9}] {m['content'][:100]}")
+            print()
+            continue
+
+        if cmd == "perfil":
+            print("\n  Perfil detectado:")
+            if memoria.perfil:
+                for k, v in memoria.perfil.items():
+                    print(f"  {k}: {v}")
+            else:
+                print("  (ainda vazio)")
+            print()
+            continue
+
+        if cmd == "banco":
+            print(f"\n  Banco de memoria:")
+            print(f"  Registros : {banco.total()}")
+            print(f"  Disponivel: {banco.disponivel}")
+            print(f"  Modelos   : {'carregados' if banco.modelos_prontos else 'lazy (carregam no 1o uso)'}")
+            print()
+            continue
+
+        if cmd == "memorias":
+            registros = banco.listar()
+            print(f"\n  Registros no banco ({len(registros)}):")
+            for r in registros:
+                ts = r["meta"].get("ts", "")
+                print(f"  [{r['id'][-8:]}]  {r['texto'][:75]}  ({ts})")
+            if not registros:
+                print("  (banco vazio)")
+            print()
+            continue
+
+        if cmd.startswith("salvar "):
+            texto = entrada[7:].strip()
+            if texto:
+                doc_id = banco.adicionar(texto, fonte="manual")
+                print(f"  Salvo — ID: {doc_id[-8:]}\n")
+            else:
+                print("  Uso: salvar <texto>\n")
+            continue
+
+        if cmd.startswith("esquecer "):
+            doc_id = entrada[9:].strip()
+            banco.remover(doc_id)
+            print(f"  Removido: {doc_id}\n")
+            continue
+
+        # ── Linguagem natural -> banco (antes de ir ao modelo) ──
+        if _comando_banco_natural(entrada, banco):
+            continue
+
+        # ── Monta contexto para o modelo ────────────────────
+        # Histórico da sessão + nova mensagem
+        mensagens_base = memoria.historico() + [{"role": "user", "content": entrada}]
+
+        # Injeta memórias relevantes do banco (bi-encoder + rerank)
+        mensagens = _injetar_memorias(mensagens_base, banco)
 
         print()
         inicio     = time.time()
@@ -718,16 +976,18 @@ def chat():
             case _:
                 resposta, pensamento = modo_cot(mensagens)
 
-        duracao     = time.time() - inicio
-        nome_modo   = MODOS[modo][0]
-        ocultar_pen = modo == "7"   # compacto não exibe raciocínio
+        duracao   = time.time() - inicio
+        nome_modo = MODOS[modo][0]
 
-        _exibir(pensamento, resposta, nome_modo, duracao, mostrar_pens=not ocultar_pen)
+        _exibir(pensamento, resposta, nome_modo, duracao, mostrar_pens=(modo != "7"))
+
+        # Extrai fatos da troca e salva no banco automaticamente
+        _extrair_e_salvar(entrada, resposta, banco)
 
         # Atualiza perfil para modo adaptativo
         _atualizar_perfil(entrada, memoria)
 
-        # Persiste no histórico
+        # Persiste histórico da sessão
         memoria.add("user",      entrada)
         memoria.add("assistant", resposta)
 

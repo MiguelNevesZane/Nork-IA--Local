@@ -37,7 +37,9 @@
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\\\\\" -Recurse -File | Where-Object { $_.FullName -notmatch \"venv_cuda|llm_finetuned|__pycache__\" } | Select-Object Name, @{N=\"Tamanho\";E={\"{0:N0} KB\" -f \\($_.Length/1KB\\)}}, LastWriteTime | Sort-Object LastWriteTime)",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Miguel.N.Zane\\\\Desktop\\\\RPA_IA\\\\\" | Where-Object { $_.Name -notmatch \"venv_cuda|llm_finetuned\" } | Select-Object Name, @{N=\"Tipo\";E={if\\($_.PSIsContainer\\){\"pasta\"}else{\"arquivo\"}}})",
       "PowerShell(python -c \"import requests; print\\('requests OK:', requests.__version__\\)\" 2>&1)",
-      "PowerShell(Get-Command *)"
+      "PowerShell(Get-Command *)",
+      "Bash(Get-ChildItem -Recurse -Force)",
+      "Bash(Select-Object FullName)"
     ]
   }
 }
