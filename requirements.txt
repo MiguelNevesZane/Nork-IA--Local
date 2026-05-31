@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────
+# Nork-IA — Dependências Python
+# Instale com: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────
+
+# ── Núcleo (obrigatório) ─────────────────────────────────────
+requests>=2.28.0                  # comunicação com Ollama /api/chat
+
+# ── Memória semântica (obrigatório) ─────────────────────────
+chromadb>=0.4.0                   # banco vetorial persistente
+sentence-transformers>=2.2.0      # bi-encoder (all-MiniLM) + cross-encoder (ms-marco)
+torch>=2.0.0                      # backend dos modelos de embedding
+
+# ── Orquestração LangGraph (Camada 5 — grafo de estados) ────
+# Instale para habilitar traces e o modo verificador via grafo:
+#   pip install langgraph langchain-core
+langgraph>=0.2.0                  # grafo de estados com transições explícitas
+langchain-core>=0.2.0             # dependência do langgraph
+
+# ── RAG avançado — LlamaIndex (Camada 4 — Modo 5) ───────────
+# Instale para code-aware splitting nos documentos de ./docs/:
+#   pip install llama-index-core llama-index-vector-stores-chroma
+# llama-index-core>=0.10.0        # opcional — splitting por função/classe
+# llama-index-vector-stores-chroma>=0.1.0  # opcional — integração ChromaDB
+
+# ── Fine-tuning local QLoRA (Camada 7 — OPCIONAL) ───────────
+# Requer GPU com >=6 GB VRAM (apertado) ou >=8 GB (confortável)
+# Instale apenas se for treinar: pip install unsloth
+# unsloth                         # QLoRA otimizado (backend: bitsandbytes)
+# datasets>=2.0.0                 # carregamento do corpus de treinamento

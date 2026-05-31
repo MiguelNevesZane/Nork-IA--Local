@@ -25,9 +25,7 @@ Dependências:
 
 import json
 import re
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
@@ -35,21 +33,26 @@ from pathlib import Path
 
 import requests
 
+import sandbox as _sandbox
 from banco_memoria import BancoMemoria
+from roteador_modelos import rotear as _rotear, temperatura_para_modo as _temp_modo
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────────────────────
 
-OLLAMA_CHAT = "http://localhost:11434/api/chat"
-OLLAMA_TAGS = "http://localhost:11434/api/tags"
-MODELO      = "deepseek-r1:8b"
-TIMEOUT     = 300          # segundos — 30 etapas geram muitos tokens
-NUM_PREDICT = 8192         # tokens máximos por resposta
-SC_N        = 3            # tentativas no self-consistency
-MAX_FIX     = 2            # tentativas de autocorreção de código
-PASTA_DOCS  = Path("./docs")
-SEP         = "─" * 58
+OLLAMA_CHAT  = "http://localhost:11434/api/chat"
+OLLAMA_TAGS  = "http://localhost:11434/api/tags"
+MODELO       = "deepseek-r1:8b"
+TIMEOUT      = 300          # segundos — 30 etapas geram muitos tokens
+NUM_PREDICT  = 8192         # tokens máximos por resposta
+NUM_CTX      = 8192         # janela de contexto (equilibra VRAM x qualidade)
+KEEP_ALIVE   = "10m"        # mantém modelo na VRAM entre chamadas
+SC_N         = 3            # tentativas no self-consistency
+MAX_FIX      = 2            # tentativas de autocorreção de código
+PASTA_DOCS   = Path("./docs")
+SEP          = "─" * 58
+USO_GRAFO    = True         # usa LangGraph quando disponível (modo 3 e modos gerais)
 
 # ─────────────────────────────────────────────────────────────
 # REGRAS BASE (aplicadas em todos os modos)
@@ -123,6 +126,10 @@ ETAPA 30 — CONCLUSAO
 <answer>
 [Resposta clara, estruturada e completa]
 </answer>"""
+
+METODOLOGIA = (
+    "Para executar todas essas tasks use essa metodologia de trabalho -> Método de trabalho desta sessão 1. Filosofia central Diagnóstico antes de corrigir. Correção cirúrgica, não reescrita. Cada mudança no código foi a menor possível pra resolver o problema específico, sem \"limpezas oportunistas\" ou refatorações que o usuário não pediu. 2. Regras que segui em TODA intervenção Regra 1 — Investigar antes de propor Nunca propus solução sem primeiro entender o estado atual do código. Para cada bug: Ler o arquivo exato em volta da linha afetada Seguir a cadeia de imports/chamadas até achar a causa raiz real Confirmar a hipótese com uma query ou log antes de tocar em código Regra 2 — Backup antes de mexer em produção Sempre que o trabalho tocava o banco ou o código em produção, rodei um backup imediatamente: Cópia do platform.db com timestamp Tarball do src/ relevante Nome explícito (platform_YYYYMMDD_HHMMSS_descricao.db) Regra 3 — Propor plano, esperar aprovação Para qualquer mudança não-trivial, montei um plano em lista curta com: O que vai mudar Por que vai mudar Perguntas de desambiguação (ex: \"desativar por padrão? OK?\") Apresentei em tabela ou bullets com trade-offs, nunca como um parágrafo longo Só executei depois do \"sim\" Regra 4 — Ciclo de correção iterativo Você definiu o padrão, eu segui: 1. Entender o erro 2. Achar a causa raiz 3. Propor correção com justificativa 4. Aplicar 5. Testar (unitário/integração/e2e conforme o caso) 6. Se falhar, voltar pro passo 1 com o novo dado 7. Se passar, checar regressão nas features vizinhas 8. Se tudo OK, commit 9. Se quebrou, rollback do backup"
+)
 
 SYSTEM_CODIGO = _REGRAS_BASE + """
 Você é um especialista em Python.
@@ -267,19 +274,26 @@ def _chamar_ollama(
     system: str,
     temperature: float = 0.0,
     spinner: Spinner | None = None,
+    modelo: str | None = None,
 ) -> str:
     """
     Chama POST /api/chat com roles user/assistant separados.
     Usa stream=True internamente mas acumula o texto silenciosamente.
     O spinner (se fornecido) é atualizado conforme etapas aparecem no stream.
+
+    Args:
+        modelo: sobrescreve MODELO global (roteador passa o modelo selecionado).
     """
+    modelo_uso = modelo or MODELO
     payload = {
-        "model":   MODELO,
-        "messages": [{"role": "system", "content": system}] + mensagens,
+        "model":      modelo_uso,
+        "messages":   [{"role": "system", "content": system}] + mensagens,
+        "keep_alive": KEEP_ALIVE,
         "options": {
             "temperature": temperature,
             "top_p":       0.95 if temperature > 0 else 1.0,
             "num_predict": NUM_PREDICT,
+            "num_ctx":     NUM_CTX,
         },
         "stream": True,
     }
@@ -372,53 +386,44 @@ def _exibir(pensamento: str, resposta: str, modo_nome: str, duracao: float, most
 # MODOS DE RESPOSTA
 # ─────────────────────────────────────────────────────────────
 
-def modo_cot(mensagens: list[dict]) -> tuple[str, str]:
+def modo_cot(mensagens: list[dict], modelo: str | None = None) -> tuple[str, str]:
     """Modo 1 — Chain-of-Thought com 30 etapas obrigatórias."""
     sp = Spinner("Iniciando raciocínio profundo")
     sp.iniciar()
-    bruto = _chamar_ollama(mensagens, SYSTEM_COT, spinner=sp)
+    bruto = _chamar_ollama(mensagens, SYSTEM_COT, temperature=0.6, spinner=sp, modelo=modelo)
     sp.parar()
     return _resposta(bruto), _pensamento(bruto)
 
 
-def modo_codigo(mensagens: list[dict], verbose: bool = True) -> tuple[str, str]:
+def modo_codigo(
+    mensagens: list[dict],
+    verbose: bool = True,
+    modelo: str | None = None,
+) -> tuple[str, str]:
     """Modo 2 — Few-shot + CoT para Python."""
     if verbose:
         print(f"\n  Gerando codigo com exemplos de referencia...\n")
 
     ultima = mensagens[-1]["content"]
     msgs   = mensagens[:-1] + [{"role": "user", "content": f"{FEW_SHOT_CODIGO}\n---\n{ultima}"}]
-    bruto  = _chamar_ollama(msgs, SYSTEM_CODIGO)
+    bruto  = _chamar_ollama(msgs, SYSTEM_CODIGO, modelo=modelo)
     return _codigo(bruto), _pensamento(bruto)
 
 
-def _executar_codigo(codigo: str) -> tuple[bool, str]:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-        f.write(codigo)
-        caminho = f.name
-    try:
-        r = subprocess.run([sys.executable, caminho], capture_output=True, text=True, timeout=15)
-        return (r.returncode == 0), (r.stdout if r.returncode == 0 else r.stderr)
-    except subprocess.TimeoutExpired:
-        return False, "TIMEOUT: codigo demorou mais de 15 segundos"
-    finally:
-        Path(caminho).unlink(missing_ok=True)
-
-
-def modo_verificador(mensagens: list[dict]) -> tuple[str, str]:
-    """Modo 3 — Gera código, executa, autocorrige até MAX_FIX vezes."""
+def modo_verificador(mensagens: list[dict], modelo: str | None = None) -> tuple[str, str]:
+    """Modo 3 — Gera código, executa no sandbox, autocorrige até MAX_FIX vezes."""
     print(f"\n  Gerando e testando codigo automaticamente...\n")
 
-    codigo, pens = modo_codigo(mensagens, verbose=False)
+    codigo, pens = modo_codigo(mensagens, verbose=False, modelo=modelo)
 
     for tentativa in range(MAX_FIX + 1):
         print(f"  --- Tentativa {tentativa + 1} ---")
         print(codigo)
         print()
 
-        ok, output = _executar_codigo(codigo)
+        ok, output = _sandbox.executar(codigo)
         if ok:
-            print(f"  Codigo executou sem erros. Output: {output or '(sem output)'}")
+            print(f"  Codigo executou sem erros. Output: {output}")
             return codigo, pens
 
         print(f"  Erro:\n{output}\n")
@@ -426,16 +431,22 @@ def modo_verificador(mensagens: list[dict]) -> tuple[str, str]:
             print(f"  Pedindo correcao ({tentativa + 2}/{MAX_FIX + 1})...\n")
             msgs_fix = mensagens + [
                 {"role": "assistant", "content": codigo},
-                {"role": "user",      "content": f"Erro ao executar:\n{output}\n\nCorrenja entre <answer></answer>."},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Erro ao executar:\n{output}\n\n"
+                        "Corrija o código. Coloque o código corrigido entre <answer></answer>."
+                    ),
+                },
             ]
-            bruto  = _chamar_ollama(msgs_fix, SYSTEM_CODIGO)
+            bruto  = _chamar_ollama(msgs_fix, SYSTEM_CODIGO, modelo=modelo)
             codigo = _codigo(bruto)
 
     print("  Nao foi possivel corrigir apos todas as tentativas.")
     return codigo, pens
 
 
-def modo_self_consistency(mensagens: list[dict]) -> tuple[str, str]:
+def modo_self_consistency(mensagens: list[dict], modelo: str | None = None) -> tuple[str, str]:
     """Modo 4 — Gera SC_N respostas independentes e vota na mais comum."""
     print(f"\n  Gerando {SC_N} respostas e votando na melhor...\n")
 
@@ -443,7 +454,7 @@ def modo_self_consistency(mensagens: list[dict]) -> tuple[str, str]:
     for i in range(SC_N):
         sp = Spinner(f"Tentativa {i + 1}/{SC_N}")
         sp.iniciar()
-        bruto = _chamar_ollama(mensagens, SYSTEM_COT, temperature=0.7)
+        bruto = _chamar_ollama(mensagens, SYSTEM_COT, temperature=0.7, modelo=modelo)
         sp.parar()
         r = _resposta(bruto).strip()
         respostas.append(r)
@@ -454,7 +465,11 @@ def modo_self_consistency(mensagens: list[dict]) -> tuple[str, str]:
     return mais_comum, ""
 
 
-def modo_adaptativo(mensagens: list[dict], perfil: dict) -> tuple[str, str]:
+def modo_adaptativo(
+    mensagens: list[dict],
+    perfil: dict,
+    modelo: str | None = None,
+) -> tuple[str, str]:
     """Modo 6 — Adapta resposta ao perfil detectado do usuário."""
     linhas_perfil = "\n".join(f"- {k}: {v}" for k, v in perfil.items())
     if not linhas_perfil:
@@ -464,22 +479,22 @@ def modo_adaptativo(mensagens: list[dict], perfil: dict) -> tuple[str, str]:
 
     sp = Spinner("Analisando perfil e adaptando resposta")
     sp.iniciar()
-    bruto = _chamar_ollama(mensagens, system, temperature=0.1)
+    bruto = _chamar_ollama(mensagens, system, temperature=0.1, modelo=modelo)
     sp.parar()
     return _resposta(bruto), _pensamento(bruto)
 
 
-def modo_compacto(mensagens: list[dict]) -> tuple[str, str]:
+def modo_compacto(mensagens: list[dict], modelo: str | None = None) -> tuple[str, str]:
     """Modo 7 — Resposta curta e direta, sem raciocínio visível."""
-    bruto = _chamar_ollama(mensagens, SYSTEM_COMPACTO)
+    bruto = _chamar_ollama(mensagens, SYSTEM_COMPACTO, modelo=modelo)
     return _resposta(bruto), ""
 
 
-def modo_ultra(mensagens: list[dict]) -> tuple[str, str]:
+def modo_ultra(mensagens: list[dict], modelo: str | None = None) -> tuple[str, str]:
     """Modo 8 — 30 etapas + perspectiva alternativa + síntese final."""
     sp = Spinner("Ultra-pensamento ativo (pode demorar 2-4 min)")
     sp.iniciar()
-    bruto = _chamar_ollama(mensagens, SYSTEM_ULTRA, spinner=sp)
+    bruto = _chamar_ollama(mensagens, SYSTEM_ULTRA, temperature=0.6, spinner=sp, modelo=modelo)
     sp.parar()
     return _resposta(bruto), _pensamento(bruto)
 
@@ -488,6 +503,17 @@ def modo_ultra(mensagens: list[dict]) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 
 class RAGLocal:
+    """
+    RAG sobre arquivos locais em ./docs/.
+
+    Quando llama-index + llama-index-vector-stores-chroma estão instalados,
+    usa code-aware splitting (.py por função/classe, .txt por sentença).
+    Caso contrário, usa indexação simples por janela de caracteres.
+
+    Instale para habilitar splitting avançado:
+        pip install llama-index-core llama-index-vector-stores-chroma
+    """
+
     def __init__(self, pasta: Path = PASTA_DOCS):
         self.pasta      = pasta
         self.disponivel = False
@@ -501,53 +527,110 @@ class RAGLocal:
             self.client  = chromadb.Client()
             self.colecao = self.client.get_or_create_collection("docs_locais")
             self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
-            self._indexar()
+            n = self._indexar()
             self.disponivel = True
-            print(f"  RAG inicializado: {self.colecao.count()} chunks indexados.")
+            print(f"  RAG inicializado: {n} chunks indexados.")
         except ImportError:
             print("  RAG desativado. Instale: pip install chromadb sentence-transformers")
         except Exception as e:
             print(f"  RAG desativado: {e}")
 
-    def _indexar(self):
+    def _indexar(self) -> int:
         if not self.pasta.exists():
             self.pasta.mkdir(exist_ok=True)
-            return
-        arquivos = list(self.pasta.glob("**/*.txt")) + list(self.pasta.glob("**/*.py"))
+            return 0
+
+        arquivos = (
+            list(self.pasta.glob("**/*.txt"))
+            + list(self.pasta.glob("**/*.py"))
+            + list(self.pasta.glob("**/*.md"))
+        )
+        total = 0
+
         for arq in arquivos:
             texto  = arq.read_text(encoding="utf-8", errors="ignore")
-            chunks = [texto[i:i + 500] for i in range(0, len(texto), 400)]
+            chunks = (
+                _split_codigo(texto)
+                if arq.suffix == ".py"
+                else _split_texto(texto)
+            )
             for j, chunk in enumerate(chunks):
-                self.colecao.add(
-                    documents=[chunk],
-                    ids=[f"{arq.stem}_{j}"],
-                    metadatas=[{"fonte": str(arq)}],
-                )
+                doc_id = f"{arq.stem}_{j}"
+                try:
+                    self.colecao.add(
+                        documents=[chunk],
+                        ids=[doc_id],
+                        metadatas=[{"fonte": str(arq), "tipo": arq.suffix}],
+                    )
+                    total += 1
+                except Exception:
+                    pass  # chunk já indexado (ID duplicado)
 
-    def _buscar(self, pergunta: str, n: int = 3) -> str:
+        return total
+
+    def _buscar(self, pergunta: str, n: int = 5) -> str:
         if not self.disponivel or self.colecao.count() == 0:
             return ""
         docs = self.colecao.query(query_texts=[pergunta], n_results=n).get("documents", [[]])[0]
         return "\n\n---\n\n".join(docs)
 
-    def perguntar(self, mensagens: list[dict]) -> tuple[str, str]:
-        pergunta  = mensagens[-1]["content"]
-        contexto  = self._buscar(pergunta)
+    def perguntar(
+        self,
+        mensagens: list[dict],
+        modelo: str | None = None,
+    ) -> tuple[str, str]:
+        pergunta = mensagens[-1]["content"]
+        contexto = self._buscar(pergunta)
 
         if contexto:
             print(f"\n  RAG: {len(contexto)} chars de contexto injetados.\n")
             msgs = mensagens[:-1] + [{
                 "role":    "user",
-                "content": f"CONTEXTO:\n{contexto}\n\nPERGUNTA:\n{pergunta}",
+                "content": f"CONTEXTO DOS DOCUMENTOS:\n{contexto}\n\nPERGUNTA:\n{pergunta}",
             }]
         else:
+            print("  RAG: nenhum documento relevante encontrado.\n")
             msgs = mensagens
 
         sp = Spinner("Consultando documentos")
         sp.iniciar()
-        bruto = _chamar_ollama(msgs, SYSTEM_COT)
+        bruto = _chamar_ollama(msgs, SYSTEM_COT, temperature=0.6, modelo=modelo)
         sp.parar()
         return _resposta(bruto), _pensamento(bruto)
+
+
+# ─────────────────────────────────────────────────────────────
+# SPLITTING DE DOCUMENTOS PARA RAG
+# ─────────────────────────────────────────────────────────────
+
+def _split_codigo(texto: str, tamanho_max: int = 600) -> list[str]:
+    """Divide código Python nos limites de funções e classes."""
+    import re as _re
+    marcadores = [m.start() for m in _re.finditer(r"^(?:def |class |async def )", texto, _re.MULTILINE)]
+    if not marcadores:
+        return _split_por_janela(texto, tamanho_max)
+
+    posicoes = marcadores + [len(texto)]
+    chunks: list[str] = []
+    for i in range(len(posicoes) - 1):
+        bloco = texto[posicoes[i]:posicoes[i + 1]].strip()
+        if not bloco:
+            continue
+        if len(bloco) > tamanho_max * 2:
+            chunks.extend(_split_por_janela(bloco, tamanho_max))
+        else:
+            chunks.append(bloco)
+    return chunks
+
+
+def _split_texto(texto: str, tamanho: int = 500, overlap: int = 100) -> list[str]:
+    """Divide texto em chunks com overlap para melhor cobertura semântica."""
+    passo = tamanho - overlap
+    return [texto[i:i + tamanho] for i in range(0, len(texto), passo) if texto[i:i + tamanho].strip()]
+
+
+def _split_por_janela(texto: str, tamanho: int = 600) -> list[str]:
+    return [texto[i:i + tamanho] for i in range(0, len(texto), tamanho) if texto[i:i + tamanho].strip()]
 
 # ─────────────────────────────────────────────────────────────
 # MEMORIA DE CONVERSA
@@ -844,11 +927,33 @@ def _comando_banco_natural(entrada: str, banco: BancoMemoria) -> bool:
     return False
 
 
+def _carregar_modelos() -> list[str]:
+    """Retorna lista de modelos instalados no Ollama."""
+    try:
+        r = requests.get(OLLAMA_TAGS, timeout=3)
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
 def chat():
-    memoria = Memoria()
-    banco   = BancoMemoria()
-    rag     = None
-    modo    = "1"
+    memoria            = Memoria()
+    banco              = BancoMemoria()
+    rag                = None
+    modo               = "1"
+    _modelos_disp      = _carregar_modelos()
+    _grafo_app         = None
+    _grafo_disponivel  = False
+
+    # Inicializa grafo LangGraph se disponível e configurado
+    if USO_GRAFO:
+        try:
+            from grafo import construir_grafo
+            _grafo_app, _grafo_disponivel = construir_grafo(banco, _modelos_disp)
+            if _grafo_disponivel:
+                print("  Grafo LangGraph ativo (traces em nork.grafo)")
+        except Exception:
+            _grafo_disponivel = False
 
     _exibir_header(modo)
 
@@ -900,6 +1005,7 @@ def chat():
             print(f"  Registros : {banco.total()}")
             print(f"  Disponivel: {banco.disponivel}")
             print(f"  Modelos   : {'carregados' if banco.modelos_prontos else 'lazy (carregam no 1o uso)'}")
+            print(f"  Grafo     : {'LangGraph ativo' if _grafo_disponivel else 'direto (langgraph nao instalado)'}")
             print()
             continue
 
@@ -934,43 +1040,65 @@ def chat():
             continue
 
         # ── Monta contexto para o modelo ────────────────────
-        # Histórico da sessão + nova mensagem
         mensagens_base = memoria.historico() + [{"role": "user", "content": entrada}]
+        mensagens      = _injetar_memorias(mensagens_base, banco)
 
-        # Injeta memórias relevantes do banco (bi-encoder + rerank)
-        mensagens = _injetar_memorias(mensagens_base, banco)
+        # Seleciona modelo via roteador
+        modelo_selecionado, _ = _rotear(entrada, modo, _modelos_disp)
 
         print()
         inicio     = time.time()
         pensamento = ""
 
-        match modo:
-            case "1":
-                resposta, pensamento = modo_cot(mensagens)
-            case "2":
-                resposta, pensamento = modo_codigo(mensagens)
-            case "3":
-                resposta, pensamento = modo_verificador(mensagens)
-            case "4":
-                resposta, pensamento = modo_self_consistency(mensagens)
-            case "5":
-                if rag is None:
-                    print("  Inicializando RAG (primeira vez pode demorar)...")
-                    rag = RAGLocal()
-                resposta, pensamento = rag.perguntar(mensagens)
-            case "6":
-                resposta, pensamento = modo_adaptativo(mensagens, memoria.perfil)
-            case "7":
-                resposta, pensamento = modo_compacto(mensagens)
-            case "8":
-                resposta, pensamento = modo_ultra(mensagens)
-            case _:
-                resposta, pensamento = modo_cot(mensagens)
+        # ── Via LangGraph (modo 3 sempre; demais quando grafo ativo) ──
+        if _grafo_disponivel and _grafo_app and modo == "3":
+            try:
+                estado = _grafo_app.invoke({
+                    "entrada":   entrada,
+                    "modo":      modo,
+                    "mensagens": mensagens,
+                    "perfil":    memoria.perfil,
+                    "tentativas": 0,
+                    "trace":     [],
+                })
+                resposta   = estado.get("resposta", "")
+                pensamento = estado.get("pensamento", "")
+            except Exception as e:
+                print(f"  [Grafo] Erro: {e} — fallback para execucao direta\n")
+                resposta, pensamento = modo_verificador(mensagens, modelo=modelo_selecionado)
+        else:
+            # ── Execução direta (todos os modos) ────────────
+            match modo:
+                case "1":
+                    resposta, pensamento = modo_cot(mensagens, modelo=modelo_selecionado)
+                case "2":
+                    resposta, pensamento = modo_codigo(mensagens, modelo=modelo_selecionado)
+                case "3":
+                    resposta, pensamento = modo_verificador(mensagens, modelo=modelo_selecionado)
+                case "4":
+                    resposta, pensamento = modo_self_consistency(mensagens, modelo=modelo_selecionado)
+                case "5":
+                    if rag is None:
+                        print("  Inicializando RAG (primeira vez pode demorar)...")
+                        rag = RAGLocal()
+                    resposta, pensamento = rag.perguntar(mensagens, modelo=modelo_selecionado)
+                case "6":
+                    resposta, pensamento = modo_adaptativo(
+                        mensagens, memoria.perfil, modelo=modelo_selecionado
+                    )
+                case "7":
+                    resposta, pensamento = modo_compacto(mensagens, modelo=modelo_selecionado)
+                case "8":
+                    resposta, pensamento = modo_ultra(mensagens, modelo=modelo_selecionado)
+                case _:
+                    resposta, pensamento = modo_cot(mensagens, modelo=modelo_selecionado)
 
         duracao   = time.time() - inicio
         nome_modo = MODOS[modo][0]
+        modelo_label = f"{modelo_selecionado} | " if modelo_selecionado != MODELO else ""
 
         _exibir(pensamento, resposta, nome_modo, duracao, mostrar_pens=(modo != "7"))
+        print(f"  [modelo: {modelo_label}{nome_modo}]")
 
         # Extrai fatos da troca e salva no banco automaticamente
         _extrair_e_salvar(entrada, resposta, banco)

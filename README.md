@@ -1,69 +1,79 @@
-﻿# Nork-IA — Motor de Inteligência Artificial Local
+# Nork-IA — Motor de Inteligência Artificial Local
 
-> Assistente conversacional avançado com 8 modos de resposta, memória semântica persistente e inferência totalmente local via Ollama.
+> Assistente conversacional avançado com roteador de modelos, 8 modos de resposta, memória semântica, sandbox de código e orquestração LangGraph. Inferência 100% local via Ollama.
 
 ---
 
 ## Visão Geral
 
-O **Nork-IA** é um motor de IA conversacional construído para rodar 100% localmente, sem depender de APIs de nuvem. Ele combina o modelo de raciocínio `deepseek-r1:8b` (via Ollama) com uma arquitetura de memória semântica em duas camadas (bi-encoder + cross-encoder), oferecendo 8 modos de resposta especializados para diferentes tipos de tarefa — desde análise profunda em 30 etapas até geração e auto-correção de código Python.
+O **Nork-IA** combina múltiplos modelos Ollama (Q4_K_M, 6-8 GB VRAM) com um roteador automático de tarefas, memória semântica bi-encoder + cross-encoder, execução segura de código Python e orquestração via grafo de estados LangGraph.
 
 ```
 Entrada do Usuário
-        ↓
- [Verificação de Comandos]
-        ↓
- [Contexto: Histórico + Memória Semântica]
-        ↓
- [Seleção do Modo de Resposta]
-        ↓
- [Ollama: deepseek-r1:8b]
-        ↓
- [Extração: Pensamento + Resposta]
-        ↓
- [Auto-Salvar Fatos + Persistência]
-        ↓
- Loop
+       |
+  [Roteador] -> seleciona modelo ideal por tarefa
+       |
+  [Contexto] -> histórico + memória semântica (bi-encoder + rerank)
+       |
+  [Inferência] -> Ollama /api/chat com modelo selecionado
+       |
+  [Sandbox]? -> executa Python, captura output (Modo 3)
+       |
+  [Reflexão]? -> autocorrige até MAX_FIX tentativas
+       |
+  [Resposta + Auto-save de Fatos]
 ```
 
 ---
 
-## Funcionalidades Principais
+## Arquitetura
 
-- **8 Modos de Resposta** — cada modo otimizado para um tipo específico de tarefa
-- **Memória Semântica Persistente** — banco vetorial com ChromaDB, recuperação por relevância (bi-encoder + reranker)
-- **Execução e Auto-Correção de Código** — gera Python, executa e corrige automaticamente até 2 vezes
-- **Self-Consistency** — 3 respostas independentes com votação para reduzir alucinações
-- **RAG Local** — indexa e consulta documentos da pasta `./docs/`
-- **Perfil de Usuário Adaptativo** — aprende nível técnico e estilo de comunicação
-- **Raciocínio Transparente** — processo de 30 etapas visível antes da resposta final
-- **Persistência de Sessão** — histórico completo salvo em JSON entre sessões
-- **Interface de Terminal** — spinner animado, cabeçalho com modos e comandos
+### Camada 1 — Runtime (Ollama)
+- Mantém modelo na VRAM com `KEEP_ALIVE=10m`
+- `num_ctx=8192` equilibra contexto e VRAM
+- Flash Attention e KV cache quantizado: configuráveis em `iniciar.bat`
+
+### Camada 2 — Roteador de Modelos (`roteador_modelos.py`)
+
+| Categoria | Modelo (Q4_K_M) | VRAM est. | Quando usar |
+|---|---|---|---|
+| raciocinio | deepseek-r1:8b | ~5.5 GB | CoT 30 etapas, modos 1/4/8 |
+| codigo | qwen2.5-coder:7b | ~5.0 GB | Código Python (modos 2/3) |
+| codigo_rapido | qwen2.5-coder:3b | ~2.3 GB | Respostas rápidas (modo 7) |
+| geral | qwen2.5:7b | ~5.0 GB | Conversação, RAG (modos 5/6) |
+| *(opcional)* | qwen2.5-coder:14b | ~9.0 GB | Código avançado (offload CPU) |
+
+Todos os modelos padrão cabem em 6-8 GB de VRAM. Confirme com `ollama list`.
+
+### Camada 3 — Modos de Raciocínio
+- DeepSeek R1 com temperatura 0.6 (faixa recomendada: 0.5-0.7)
+- 30 etapas CoT nomeadas, self-consistency (3 votos), ultra-pensamento
+
+### Camada 4 — Memória + RAG
+- Banco: ChromaDB + all-MiniLM-L6-v2 + cross-encoder rerank (diferencial)
+- RAG (Modo 5): splitting code-aware para .py (por função/classe) + overlap para .txt
+
+### Camada 5 — Orquestração LangGraph (`grafo.py`)
+- Grafo de estados: roteador → contexto → inferência → [execução → reflexão] → saída
+- Ativo para Modo 3 quando `langgraph` instalado
+- Traces em log `nork.grafo` (DEBUG)
+
+### Camada 6 — Sandbox (`sandbox.py`)
+- Execução segura: análise estática (AST), timeout, sem herança de proxies
+- Imports bloqueados: socket, urllib, subprocess, ctypes, etc.
+- Saída capturada e truncada em 4 KB
 
 ---
 
 ## Requisitos
 
-### Sistema
-
 | Componente | Versão Mínima |
-|------------|---------------|
-| Python     | 3.10+         |
-| Ollama     | 0.1.x+        |
-| RAM        | 8 GB          |
-| VRAM (GPU) | 6 GB (recomendado para GPU) |
-| Disco      | ~10 GB (modelo + dependências) |
-
-### Dependências Python
-
-```
-requests
-chromadb
-sentence-transformers
-torch
-transformers
-datasets
-```
+|---|---|
+| Python | 3.10+ |
+| Ollama | qualquer |
+| RAM | 8 GB |
+| VRAM | 6 GB (modelos padrão em Q4_K_M) |
+| Disco | ~10 GB (modelos + dependências) |
 
 ---
 
@@ -71,81 +81,72 @@ datasets
 
 ### 1. Instalar o Ollama
 
-Baixe e instale o Ollama em [ollama.com](https://ollama.com) e depois baixe o modelo de raciocínio:
+Baixe em [ollama.com](https://ollama.com). Depois baixe os modelos desejados:
 
 ```bash
+# Modelo padrão (raciocínio, já suficiente para tudo)
 ollama pull deepseek-r1:8b
+
+# Opcional: modelo especializado em código (melhora modos 2/3)
+ollama pull qwen2.5-coder:7b
+
+# Opcional: modelo rápido (modo 7 compacto)
+ollama pull qwen2.5-coder:3b
+
+# Opcional: modelo geral (modos 5/6)
+ollama pull qwen2.5:7b
 ```
 
-### 2. Clonar o Repositório
+O roteador usa automaticamente o melhor modelo disponível. Se só o `deepseek-r1:8b` estiver instalado, o sistema funciona normalmente.
 
-```bash
-git clone https://github.com/MiguelNevesZane/RPA_IA.git
-cd RPA_IA
-```
-
-### 3. Criar Ambiente Virtual e Instalar Dependências
+### 2. Instalar Dependências Python
 
 ```bash
 python -m venv venv_cuda
-# Windows:
-venv_cuda\Scripts\activate
-# Linux/Mac:
-source venv_cuda/bin/activate
+venv_cuda\Scripts\activate   # Windows
 
-pip install requests chromadb sentence-transformers torch transformers datasets
+# Obrigatório
+pip install requests chromadb sentence-transformers torch
+
+# Opcional: grafo de estados com traces
+pip install langgraph langchain-core
+
+# Opcional: fine-tuning QLoRA
+pip install unsloth
 ```
 
 ---
 
 ## Como Executar
 
-### Opção A — Script Windows (recomendado)
-
-```bash
-iniciar.bat
-```
-
-Ativa automaticamente o `venv_cuda` e inicia o chat.
-
-### Opção B — Python Direto
-
-Em dois terminais separados:
-
-**Terminal 1 — Iniciar o Ollama:**
+**Terminal 1 — Ollama:**
 ```bash
 ollama serve
 ```
 
-**Terminal 2 — Iniciar o Nork-IA:**
+**Terminal 2 — Nork-IA:**
 ```bash
+iniciar.bat          # Windows (ativa venv + otimizações Ollama)
+# ou
 python main.py
 ```
-
-### O que acontece na inicialização
-
-1. Verifica se o Ollama está rodando e se `deepseek-r1:8b` está disponível
-2. Inicializa o banco de memória semântica (ChromaDB em `./memoria_db/`)
-3. Carrega o histórico de sessão de `memoria_chat.json`
-4. Exibe o cabeçalho interativo com os 8 modos e comandos disponíveis
-5. Aguarda input: `Você: `
 
 ---
 
 ## Modos de Resposta
 
-Use o comando `modo` durante o chat para alternar entre os modos.
+Use `modo` no chat para alternar.
 
-| # | Nome | Descrição | Quando Usar |
-|---|------|-----------|-------------|
-| 1 | **CoT Profundo** | Raciocínio em cadeia com 30 etapas explícitas | Perguntas analíticas complexas |
-| 2 | **Código Few-Shot** | Geração de Python com exemplos de referência | Pedidos de código geral |
-| 3 | **Código + Verificação** | Gera, executa e auto-corrige Python | Problemas que exigem código funcional |
-| 4 | **Self-Consistency** | 3 respostas independentes + votação | Decisões onde consistência importa |
-| 5 | **RAG Local** | Consulta arquivos da pasta `./docs/` | Perguntas sobre sua base de documentos |
-| 6 | **Adaptativo** | Aprende perfil do usuário e adapta o estilo | Uso contínuo personalizado |
-| 7 | **Compacto** | Máximo 3 frases, direto ao ponto | Informações rápidas |
-| 8 | **Ultra-Pensamento** | 30 etapas + 2ª perspectiva + síntese (2-4 min) | Análise máxima, sem pressa |
+| # | Nome | Modelo preferido | Quando usar |
+|---|---|---|---|
+| 1 | CoT profundo | deepseek-r1:8b | Análise, perguntas complexas |
+| 2 | Código few-shot | qwen2.5-coder:7b | Geração de Python |
+| 3 | Código + verificação | qwen2.5-coder:7b | Código que precisa rodar |
+| 4 | Self-consistency | deepseek-r1:8b | Decisões críticas (3 votos) |
+| 5 | RAG local | qwen2.5:7b | Consultar ./docs/ |
+| 6 | Adaptativo | qwen2.5:7b | Uso diário personalizado |
+| 7 | Compacto | qwen2.5-coder:3b | Respostas rápidas |
+| 8 | Ultra-pensamento | deepseek-r1:8b | Análise máxima (2-4 min) |
 
 ---
 
@@ -154,134 +155,26 @@ Use o comando `modo` durante o chat para alternar entre os modos.
 ### Sistema
 
 | Comando | Ação |
-|---------|------|
-| `modo` | Abrir menu de seleção de modo |
-| `limpar` | Apagar histórico da sessão atual |
+|---|---|
+| `modo` | Trocar modo de resposta |
+| `limpar` | Apagar histórico da sessão |
 | `memoria` | Exibir histórico de conversa |
-| `perfil` | Mostrar perfil detectado do usuário |
-| `banco` | Status do banco de memória semântica |
-| `sair` | Encerrar o programa |
+| `perfil` | Mostrar perfil detectado |
+| `banco` | Status do banco de memória |
+| `memorias` | Listar registros do banco |
+| `salvar <texto>` | Salvar diretamente no banco |
+| `esquecer <id>` | Remover registro por ID |
+| `sair` | Encerrar |
 
 ### Memória Semântica (linguagem natural)
 
 | Comando | Ação |
-|---------|------|
-| `lembra que <texto>` | Salvar fato no banco |
-| `guarda que <texto>` | Alias para salvar fato |
-| `o que você sabe?` | Listar todas as memórias |
-| `o que você sabe sobre <tema>?` | Buscar memórias por tema |
-| `esquece tudo` | Limpar banco inteiro |
-| `memorias` | Listar 15 registros recentes |
-| `salvar <texto>` | Salvar diretamente |
-| `esquecer <id>` | Remover registro específico |
-
----
-
-## Arquitetura Detalhada
-
-### Motor Principal (`motor_ia_avancado.py`)
-
-O núcleo do sistema. Gerencia o ciclo de conversa, seleção de modo, comunicação com o Ollama e persistência de dados.
-
-**Integração com Ollama:**
-- Endpoint: `http://localhost:11434/api/chat`
-- Modelo: `deepseek-r1:8b`
-- Timeout: 300 segundos (necessário para modos de 30 etapas)
-- Tokens máximos: 8192 por resposta
-
-**Extração de Texto:**
-- `_pensamento()` — extrai raciocínio de tags `<think>` / `<thinking>`
-- `_resposta()` — extrai resposta final de tags `<answer>` ou texto pós-thinking
-- `_codigo()` — extrai blocos de código Python de markdown
-
-**Perfil Adaptativo (`_atualizar_perfil`):**
-- Detecta área: `"desenvolvimento de software"` por menções a código, Python, bug, API
-- Detecta estilo: `"curtas"` vs `"detalhadas"` pelo comprimento médio das mensagens
-- Captura preferências por padrões de linguagem natural
-
-**Prompts de Sistema por Modo:**
-
-- `SYSTEM_COT` — 30 etapas de raciocínio nomeadas (leitura literal → intenção real → contexto → decomposição → hipóteses → evidências → causas → mecanismos → consequências → exemplos → casos extremos → exceções → história → ciência → prática → críticas → refutação → premissas → vieses → pontos cegos → analogias → filosofia → síntese parcial → consistência → revisão crítica → refinamento → clareza → conclusão)
-- `SYSTEM_CODIGO` — especialista Python com exemplos few-shot (filtragem CSV, retry HTTP com backoff exponencial)
-- `SYSTEM_COMPACTO` — respostas diretas, máximo 3 frases, sem emojis
-- `SYSTEM_ADAPTATIVO` — instrução para adaptar tom e profundidade ao perfil detectado
-- `SYSTEM_ULTRA` — 30 etapas + segunda perspectiva independente + síntese final
-
----
-
-### Banco de Memória Semântica (`banco_memoria.py`)
-
-Pipeline de dois estágios para recuperação precisa de memórias:
-
-```
-Pergunta do Usuário
-        ↓
-[Bi-Encoder: all-MiniLM-L6-v2]
-   — embeddings rápidos
-   — recupera top-20 candidatos por similaridade cosseno
-        ↓
-[Cross-Encoder: ms-marco-MiniLM-L-6-v2]
-   — reranking preciso dos 20 candidatos
-   — retorna top-5 mais relevantes
-        ↓
-Contexto injetado antes da inferência
-```
-
-**Auto-Salvamento de Fatos:**
-
-O sistema detecta automaticamente fatos pessoais por padrões regex:
-
-```
-\bmeu nome\b  |  \beu sou\b  |  \beu trabalho\b
-\bgosto de\b  |  \bnão gosto\b  |  \blembra que\b
-```
-
-**Carregamento Lazy:**
-- Fase 1 (startup): Apenas ChromaDB, sem carregar modelos de embedding (instantâneo)
-- Fase 2 (primeiro uso): Carrega modelos de embedding (~160 MB total)
-
-**Configurações:**
-
-| Parâmetro | Valor |
-|-----------|-------|
-| `MODELO_EMBED` | `all-MiniLM-L6-v2` |
-| `MODELO_RERANK` | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| `TOP_K_INICIAL` | 20 candidatos |
-| `TOP_N_FINAL` | 5 resultados finais |
-| Persistência | `./memoria_db/` (ChromaDB) |
-
----
-
-### RAG Local (Modo 5)
-
-- Lê arquivos `.txt` e `.py` da pasta `./docs/`
-- Divide em chunks de 400 caracteres com overlap de 500
-- Armazena vetores na coleção `"docs_locais"` do ChromaDB
-- Injeta contexto relevante no prompt antes da inferência
-
-Para usar, crie a pasta `docs/` e coloque seus arquivos:
-
-```bash
-mkdir docs
-# Coloque seus .txt ou .py dentro
-```
-
----
-
-### Corpus de Treinamento (`dados_treino.py`)
-
-Três fases de dados para uso em fine-tuning ou consulta:
-
-| Fase | Tamanho | Conteúdo |
-|------|---------|----------|
-| `CORPUS_TEXTO` | ~60 KB | Texto contínuo em 50+ tópicos (IA, física, história, biologia, filosofia, economia, etc.) |
-| `CORPUS_QA` | ~30 KB | 100+ pares pergunta-resposta estruturados em português |
-| `CORPUS_THINK` | ~10 KB | 8 exemplos trabalhados de raciocínio passo a passo |
-
-**Datasets Externos (carregamento opcional):**
-- `OpenAssistant/oasst1` — conversas humanas em português
-- `everyday-conversations-llama3.1-2k` — chat básico
-- `lmsys-chat-1m` — requer `HF_TOKEN` (acesso restrito)
+|---|---|
+| `lembra que <texto>` | Salva fato no banco |
+| `guarda que <texto>` | Alias para salvar |
+| `o que você sabe?` | Lista todas as memórias |
+| `o que você sabe sobre <tema>?` | Busca por tema (bi-encoder + rerank) |
+| `esquece tudo` | Limpa o banco inteiro |
 
 ---
 
@@ -289,119 +182,89 @@ Três fases de dados para uso em fine-tuning ou consulta:
 
 ```
 RPA_IA/
-├── main.py                    # Ponto de entrada
-├── motor_ia_avancado.py       # Motor principal (8 modos, chat, memória de sessão)
-├── banco_memoria.py           # Banco semântico (ChromaDB + bi-encoder + cross-encoder)
-├── dados_treino.py            # Corpus de treinamento em 3 fases
-├── testes.py                  # Suite de testes automatizados
-├── iniciar.bat                # Script de inicialização Windows
-├── memoria_chat.json          # Histórico de conversas (gerado automaticamente)
-├── sessao_chat.json           # Dados da sessão atual (gerado automaticamente)
-├── memoria_db/                # Banco vetorial ChromaDB (gerado automaticamente)
-│   └── ...
-└── docs/                      # Pasta para RAG local (crie manualmente)
-    └── seus_arquivos.txt
++-- main.py                    # Ponto de entrada
++-- motor_ia_avancado.py       # Motor: 8 modos, chat, memória de sessão
++-- banco_memoria.py           # Memória semântica: ChromaDB + bi-encoder + rerank
++-- roteador_modelos.py        # Catálogo de modelos + roteador automático de tarefas
++-- sandbox.py                 # Execução segura de código Python
++-- grafo.py                   # Orquestração LangGraph (opcional)
++-- testes.py                  # Suite de 46 testes
++-- requirements.txt           # Dependências com justificativas
++-- iniciar.bat                # Inicialização Windows (venv + env vars Ollama)
++-- memoria_db/                # ChromaDB (gerado automaticamente)
++-- docs/                      # Pasta para RAG local (crie manualmente)
++-- memoria_chat.json          # Histórico de conversa (gerado automaticamente)
+```
+
+---
+
+## Configuração
+
+### Parâmetros do Motor (`motor_ia_avancado.py`)
+
+```python
+MODELO      = "deepseek-r1:8b"  # modelo fallback
+TIMEOUT     = 300               # segundos (aumentar para GPUs lentas)
+NUM_PREDICT = 8192              # tokens máximos por resposta
+NUM_CTX     = 8192              # janela de contexto
+KEEP_ALIVE  = "10m"             # tempo de retenção na VRAM
+SC_N        = 3                 # tentativas self-consistency
+MAX_FIX     = 2                 # tentativas de autocorreção de código
+USO_GRAFO   = True              # habilita LangGraph quando instalado
+```
+
+### Otimizações do Ollama (`iniciar.bat`)
+
+```bat
+set OLLAMA_KEEP_ALIVE=10m         # já habilitado por padrão
+rem set OLLAMA_FLASH_ATTENTION=1  # descomente para RTX série 20+
+rem set OLLAMA_KV_CACHE_TYPE=q8_0 # descomente para economizar ~20% VRAM
 ```
 
 ---
 
 ## Testes
 
-Execute a suite completa de testes:
-
 ```bash
-# Todos os testes (inclui download de datasets)
+# Todos os testes (46 casos)
 python testes.py
 
-# Modo rápido (pula downloads de modelos)
-python testes.py --rapido
+# Com encoding correto no Windows
+$env:PYTHONIOENCODING="utf-8"; python testes.py
 ```
 
-**O que é testado:**
-
-| Bloco | Cobertura |
-|-------|-----------|
-| 1 | Utilitários de display, disponibilidade de CUDA |
-| 2 | Integridade do corpus (tamanho, fases, conteúdo) |
-| 3 | Carregamento de datasets externos com tratamento de erro |
-| 4 | Classe `CorpusDataset` para fine-tuning |
-| 5 | Sanitização de texto, persistência de histórico |
-| 6 | Validação de input |
-| 7 | Configuração e ambiente |
-| 8 | Checkpoint de modelo fine-tunado (se existir) |
-
-Saída esperada: todos os testes com `[OK]`.
+Resultado esperado: `46 OK | 0 FALHA | 0 PULADOS`
 
 ---
 
-## Configuração
+## Pipeline de Memória Semântica
 
-### Parâmetros Principais
-
-Edite `motor_ia_avancado.py` para ajustar:
-
-```python
-OLLAMA_CHAT = "http://localhost:11434/api/chat"
-MODELO      = "deepseek-r1:8b"   # Troque pelo modelo desejado
-TIMEOUT     = 300                 # Segundos (aumentar para GPUs lentas)
-NUM_PREDICT = 8192                # Tokens máximos por resposta
-SC_N        = 3                   # Respostas para self-consistency
-MAX_FIX     = 2                   # Tentativas de auto-correção de código
 ```
-
-Edite `banco_memoria.py` para ajustar a memória:
-
-```python
-MODELO_EMBED  = "all-MiniLM-L6-v2"
-MODELO_RERANK = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-TOP_K_INICIAL = 20    # Candidatos do bi-encoder
-TOP_N_FINAL   = 5     # Resultados após reranking
+Pergunta do Usuário
+       |
+ [Bi-Encoder: all-MiniLM-L6-v2]
+   embeddings rapidos -> top-20 candidatos
+       |
+ [Cross-Encoder: ms-marco-MiniLM-L-6-v2]
+   reranking preciso -> top-5 relevantes
+       |
+ Contexto injetado antes da inferencia
 ```
-
-### Trocar o Modelo
-
-Para usar outro modelo do Ollama:
-
-```bash
-ollama pull llama3.2:8b
-```
-
-Depois altere `MODELO = "llama3.2:8b"` em `motor_ia_avancado.py`.
 
 ---
 
-## Decisões de Design
+## Limitações Conhecidas
 
-| Decisão | Motivo |
-|---------|--------|
-| Ollama em vez de HF Transformers | Inferência local sem dependência de internet |
-| Carregamento lazy dos embeddings | Startup instantâneo; modelos carregam só no primeiro uso |
-| Bi-encoder + cross-encoder | Velocidade (bi) com precisão (cross) para memória semântica |
-| 30 etapas de raciocínio | Processo explícito e auditável; reduz erros por pressa |
-| Sem emojis nos prompts | Clareza e consistência; evita interferência em respostas técnicas |
-| JSON para persistência de sessão | Portátil, legível, sem dependência de banco relacional |
-| Auto-save de fatos | Usuário não precisa salvar manualmente; reduz fricção |
-
----
-
-## Limitações
-
-- **Ollama obrigatório** — o sistema não funciona sem o processo do Ollama rodando separado
-- **Modelo 8B** — menor capacidade que modelos de 70B+ ou APIs de nuvem; compensado pelos prompts estruturados
-- **Top-5 memórias** — apenas 5 resultados são injetados por consulta ao banco semântico
-- **Incompatibilidade de vetores** — trocar o modelo de embedding invalida vetores existentes; necessário reindexar
-- **Modos 1 e 8 são lentos** — 30 etapas de raciocínio podem levar 1-4 minutos dependendo do hardware
-
----
-
-## Licença
-
-Distribuído sob a licença MIT. Consulte o arquivo `LICENSE` para mais informações.
+- **Ollama obrigatório** em terminal separado (`ollama serve`)
+- **6-8 GB VRAM** limita a modelos Q4_K_M ≤ 8B por vez (troca automática pelo roteador)
+- **Modos 1 e 8** podem levar 1-4 min (30 etapas de CoT)
+- **Sandbox** não é garantia de segurança de SO — proteção é heurística via AST
+- **Trocar embedding** invalida vetores existentes em `memoria_db/`
 
 ---
 
 ## Autor
 
-**Miguel Neves Zane**  
-GitHub: [@MiguelNevesZane](https://github.com/MiguelNevesZane)  
+**Miguel Neves Zane**
+GitHub: [@MiguelNevesZane](https://github.com/MiguelNevesZane)
 Email: ayatechbr@gmail.com
