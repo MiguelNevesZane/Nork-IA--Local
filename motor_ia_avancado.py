@@ -1,20 +1,21 @@
 """
 motor_ia_avancado.py
-====================
-Motor de inferência avançado para modelos locais via Ollama.
-Combina: CoT forçado, few-shot, self-consistency, verificador automático e RAG básico.
+Motor de inferência local via Ollama com 8 modos de resposta.
+Usa /api/chat (roles estruturados) para evitar alucinações por histórico.
 
-Uso:
-    python motor_ia_avancado.py
+Modos:
+    1. CoT profundo       — 30 etapas de raciocínio
+    2. Código + few-shot  — exemplos de referência
+    3. Código + verif.    — executa e autocorrige
+    4. Self-consistency   — vota entre 3 respostas
+    5. RAG local          — usa pasta ./docs/
+    6. Adaptativo         — aprende seu perfil
+    7. Compacto           — respostas curtas e diretas
+    8. Ultra-pensamento   — 30 etapas + 2ª perspectiva + síntese
 
 Dependências:
     pip install requests
-    pip install chromadb sentence-transformers   (opcional — só para RAG)
-
-Modelos recomendados (RTX 3050 6GB):
-    ollama pull deepseek-r1:8b      # MELHOR para 6GB — raciocínio nativo (~4.9 GB VRAM) ← PADRÃO
-    ollama pull qwen2.5:7b          # alternativa geral, mais leve (~4.1 GB VRAM)
-    ollama pull qwen2.5-coder:7b    # alternativa especialista em código (~4.1 GB VRAM)
+    pip install chromadb sentence-transformers   (opcional, apenas modo 5)
 """
 
 import json
@@ -22,156 +23,151 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from pathlib import Path
 
 import requests
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
-OLLAMA_URL    = "http://localhost:11434/api/generate"
-MODELO        = "deepseek-r1:8b"   # melhor que cabe em 6GB VRAM (~4.9GB); raciocínio nativo
-TIMEOUT       = 240                # mais tempo para pensamento profundo
+OLLAMA_CHAT = "http://localhost:11434/api/chat"
+OLLAMA_TAGS = "http://localhost:11434/api/tags"
+MODELO      = "deepseek-r1:8b"
+TIMEOUT     = 300          # segundos — 30 etapas geram muitos tokens
+NUM_PREDICT = 8192         # tokens máximos por resposta
+SC_N        = 3            # tentativas no self-consistency
+MAX_FIX     = 2            # tentativas de autocorreção de código
+PASTA_DOCS  = Path("./docs")
+SEP         = "─" * 58
 
-SC_TENTATIVAS = 3
-MAX_CORRECOES = 2
-PASTA_DOCS    = Path("./docs")
+# ─────────────────────────────────────────────────────────────
+# REGRAS BASE (aplicadas em todos os modos)
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
+_REGRAS_BASE = """
+REGRAS OBRIGATÓRIAS — sem exceção:
+- Responda SEMPRE em português brasileiro
+- NUNCA use emojis de qualquer tipo
+- Nunca invente informações; se não souber, diga claramente
+- Seja preciso, factual e direto
+"""
+
+# ─────────────────────────────────────────────────────────────
 # SYSTEM PROMPTS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
-SYSTEM_GERAL = """Você é um assistente especialista que raciocina em português brasileiro com profundidade e rigor intelectual máximos.
+SYSTEM_COT = _REGRAS_BASE + """
+Você é um assistente com raciocínio profundo e rigoroso.
 
-PROCESSO OBRIGATÓRIO — execute TODAS as 30 etapas dentro de <thinking></thinking> antes de responder.
-Cada etapa deve ter ao menos 2-3 linhas de raciocínio real. Não pule nenhuma.
+PROCESSO OBRIGATÓRIO antes de qualquer resposta:
+Execute TODAS as 30 etapas dentro de <thinking></thinking>.
+Cada etapa deve ter pelo menos 2 linhas de raciocínio real.
 
-ETAPA 1  — LEITURA LITERAL
-Qual é o enunciado exato da pergunta? Repita-o com suas próprias palavras.
+ETAPA 1  — LEITURA LITERAL      Qual é o enunciado exato? Repita com suas palavras.
+ETAPA 2  — INTENCAO REAL        O que o usuário realmente quer? Há intenção implícita?
+ETAPA 3  — CONTEXTO             Em que contexto a pergunta faz sentido?
+ETAPA 4  — CONHECIMENTO         Que conceitos são necessários para responder bem?
+ETAPA 5  — DECOMPOSICAO         Quebre em todas as sub-perguntas necessárias.
+ETAPA 6  — ORDEM LOGICA         Em que ordem responder para o raciocínio ser coerente?
+ETAPA 7  — HIPOTESE INICIAL     Qual é minha resposta instintiva? Por que penso isso?
+ETAPA 8  — EVIDENCIAS           Que fatos, dados ou princípios sustentam a hipótese?
+ETAPA 9  — CAUSAS E ORIGENS     Quais são as causas raiz? Vá além do superficial.
+ETAPA 10 — MECANISMOS           Como o fenômeno funciona internamente, passo a passo?
+ETAPA 11 — CONSEQUENCIAS        Efeitos diretos, de segunda e terceira ordem.
+ETAPA 12 — EXEMPLOS             Cite pelo menos 2 exemplos reais e concretos.
+ETAPA 13 — CASOS EXTREMOS       O que acontece nos limites? Onde o raciocínio falha?
+ETAPA 14 — EXCECOES             Existem exceções? O que elas revelam sobre a regra?
+ETAPA 15 — HISTORICO            Como esse tema evoluiu ao longo do tempo?
+ETAPA 16 — CIENCIA              O que a ciência estabeleceu? Há consenso ou debate?
+ETAPA 17 — PRATICA              Como se aplica na vida real e em situações concretas?
+ETAPA 18 — CRITICA              Quem discordaria? Qual é o argumento mais forte contra?
+ETAPA 19 — REFUTACAO            Como respondo ao contra-argumento? Minha posição se sustenta?
+ETAPA 20 — SUPOSICOES           Que pressupostos estou fazendo? São válidos?
+ETAPA 21 — VIES                 Que viés pode estar distorcendo meu raciocínio?
+ETAPA 22 — PONTO CEGO           Que ângulo ou dimensão ainda não considerei?
+ETAPA 23 — ANALOGIAS            Existe algo em outro domínio que ilumina esse tema?
+ETAPA 24 — FILOSOFIA            Que questões mais profundas esse tema levanta?
+ETAPA 25 — SINTESE PARCIAL      Com tudo isso, qual é a conclusão intermediária mais sólida?
+ETAPA 26 — CONSISTENCIA         Minha conclusão é consistente com todas as etapas?
+ETAPA 27 — REVISAO CRITICA      Há saltos lógicos, generalizações ou lacunas?
+ETAPA 28 — REFINAMENTO          Depois da revisão, como aprimoro a conclusão?
+ETAPA 29 — CLAREZA              Como estruturo para ser maximamente claro e útil?
+ETAPA 30 — CONCLUSAO            Minha resposta final, completa e bem fundamentada.
 
-ETAPA 2  — INTENÇÃO REAL
-O que o usuário realmente quer saber? Pode haver uma intenção implícita além das palavras?
+EXCECAO: Para cumprimentos simples (oi, tudo bem, bom dia), responda diretamente sem etapas.
 
-ETAPA 3  — CONTEXTO
-Em que contexto essa pergunta faz sentido? Acadêmico, prático, filosófico, técnico?
-
-ETAPA 4  — CONHECIMENTO PRÉVIO NECESSÁRIO
-Que conceitos fundamentais preciso dominar para responder bem?
-
-ETAPA 5  — DECOMPOSIÇÃO EM SUB-PERGUNTAS
-Quebre a pergunta em todas as partes menores que precisam ser respondidas individualmente.
-
-ETAPA 6  — ORDEM LÓGICA
-Em que ordem devo responder as sub-perguntas para o raciocínio ser coerente?
-
-ETAPA 7  — PRIMEIRA HIPÓTESE
-Qual é minha resposta instintiva inicial? Por que penso isso?
-
-ETAPA 8  — BASE DE EVIDÊNCIAS
-Que fatos, dados, princípios ou leis sustentam minha hipótese inicial?
-
-ETAPA 9  — CAUSAS E ORIGENS
-Quais são as causas raiz do fenômeno em questão? Vá além do superficial.
-
-ETAPA 10 — MECANISMOS E PROCESSOS
-Como exatamente o fenômeno funciona, passo a passo, internamente?
-
-ETAPA 11 — CONSEQUÊNCIAS E EFEITOS
-Quais são os efeitos diretos? E os efeitos de segunda e terceira ordem?
-
-ETAPA 12 — EXEMPLOS CONCRETOS
-Cite pelo menos 2 exemplos reais que ilustram os pontos centrais.
-
-ETAPA 13 — CASOS EXTREMOS E LIMITES
-O que acontece nos casos limítrofes? Onde o raciocínio começa a falhar?
-
-ETAPA 14 — EXCEÇÕES E ANOMALIAS
-Existem exceções conhecidas à regra geral? O que elas revelam?
-
-ETAPA 15 — PERSPECTIVA HISTÓRICA
-Como esse tema evoluiu ao longo do tempo? Houve mudanças de paradigma?
-
-ETAPA 16 — PERSPECTIVA CIENTÍFICA
-O que a ciência ou a academia estabeleceu sobre isso? Há consenso ou debate?
-
-ETAPA 17 — PERSPECTIVA PRÁTICA
-Como isso se aplica na vida real, no dia a dia, em situações concretas?
-
-ETAPA 18 — PERSPECTIVA CRÍTICA
-Quem discordaria dessa visão? Qual seria o argumento mais forte do lado oposto?
-
-ETAPA 19 — REFUTAÇÃO DO CONTRA-ARGUMENTO
-Como respondo ao argumento oposto? Por que minha posição ainda se sustenta?
-
-ETAPA 20 — SUPOSIÇÕES IMPLÍCITAS
-Que pressupostos estou assumindo sem questionar? Eles são válidos?
-
-ETAPA 21 — VIESES POTENCIAIS
-Existe algum viés cognitivo, cultural ou ideológico que pode estar distorcendo meu raciocínio?
-
-ETAPA 22 — O QUE ESTOU IGNORANDO
-Que ângulo ou dimensão do problema ainda não considerei? Força-se a pensar no ponto cego.
-
-ETAPA 23 — ANALOGIAS E COMPARAÇÕES
-Existe algo em outro domínio que funciona de forma semelhante e pode iluminar esse tema?
-
-ETAPA 24 — IMPLICAÇÕES FILOSÓFICAS
-Que questões mais profundas esse tema levanta sobre conhecimento, existência ou valores?
-
-ETAPA 25 — SÍNTESE PARCIAL
-Com tudo que analisei até aqui, qual é a conclusão intermediária mais sólida?
-
-ETAPA 26 — TESTE DE CONSISTÊNCIA
-Minha conclusão parcial é consistente com todas as etapas anteriores? Há contradições?
-
-ETAPA 27 — REVISÃO CRÍTICA DA PRÓPRIA ANÁLISE
-Olhando para meu raciocínio como um todo: há saltos lógicos, generalizações indevidas ou lacunas?
-
-ETAPA 28 — REFINAMENTO FINAL
-Depois da revisão, como aprimoro ou ajusto minha conclusão?
-
-ETAPA 29 — CLAREZA E UTILIDADE
-Como estruturo a resposta para ser maximamente clara e útil para quem perguntou?
-
-ETAPA 30 — CONCLUSÃO DEFINITIVA
-Qual é minha resposta final, completa e bem fundamentada?
-
-EXCEÇÃO: Para cumprimentos simples (oi, tudo bem, bom dia), responda diretamente sem as etapas.
-
-Formato obrigatório:
+Formato obrigatório para perguntas não-triviais:
 <thinking>
 ETAPA 1 — LEITURA LITERAL
 [raciocínio]
 
-ETAPA 2 — INTENÇÃO REAL
+ETAPA 2 — INTENCAO REAL
 [raciocínio]
 
-[... todas as 30 etapas ...]
+[... todas as 30 ...]
 
-ETAPA 30 — CONCLUSÃO DEFINITIVA
+ETAPA 30 — CONCLUSAO
 [raciocínio]
 </thinking>
 <answer>
-[Resposta clara, estruturada e completa em português brasileiro]
+[Resposta clara, estruturada e completa]
 </answer>"""
 
-SYSTEM_CODIGO = """Você é um especialista em Python que responde em português brasileiro.
+SYSTEM_CODIGO = _REGRAS_BASE + """
+Você é um especialista em Python.
 
-REGRAS:
-- Raciocine antes de escrever código: use <thinking>...</thinking>
-- O código final vai entre <answer> e </answer>
-- Código deve ser funcional, com tratamento de erros
-- Prefira soluções simples e legíveis
-- Adicione comentários nas partes não óbvias"""
+Processo:
+- Raciocine antes de escrever código entre <thinking></thinking>
+- Código final entre <answer></answer>
+- Código completo, funcional, com tratamento de erros
+- Simples e legível; comente apenas o não-óbvio
+- Sem bibliotecas desnecessárias
+- Sem pseudocódigo ou trechos omitidos"""
 
-# ─────────────────────────────────────────────
-# FEW-SHOT EXAMPLES
-# ─────────────────────────────────────────────
+SYSTEM_COMPACTO = _REGRAS_BASE + """
+Você é um assistente direto e conciso.
 
-FEW_SHOT_CODIGO = """
+Regras absolutas:
+- Máximo 3 frases na resposta
+- Sem introduções, sem rodeios, sem repetição da pergunta
+- Apenas a informação essencial solicitada
+- Sem raciocínio visível"""
+
+SYSTEM_ADAPTATIVO = _REGRAS_BASE + """
+Você é um assistente que se adapta ao perfil do usuário.
+
+Perfil atual do usuário:
+{perfil}
+
+Instruções:
+- Analise silenciosamente o estilo e nível técnico da mensagem
+- Adapte linguagem, profundidade e formato ao perfil detectado
+- Não mencione que está se adaptando
+- Raciocínio de adaptação dentro de <thinking></thinking>
+- Resposta final em <answer></answer>"""
+
+SYSTEM_ULTRA = _REGRAS_BASE + """
+Você é um sistema de análise de máxima profundidade.
+
+FASE 1 — ANALISE PRIMARIA (30 etapas obrigatórias):
+Execute as mesmas 30 etapas do CoT com máximo rigor e detalhe.
+
+FASE 2 — PERSPECTIVA ALTERNATIVA:
+Reanalise o problema do ponto de vista de uma área completamente diferente.
+O que um especialista de outra disciplina diria? Que insights ele traria?
+
+FASE 3 — SINTESE FINAL:
+Integre as duas análises.
+Onde convergem? Onde divergem? Qual é a verdade mais completa que emerge?
+
+Tudo dentro de <thinking></thinking>.
+Resposta final sintetizada em <answer></answer>."""
+
+FEW_SHOT_CODIGO = """\
 Exemplos de qualidade esperada:
 
 --- Exemplo 1 ---
@@ -189,95 +185,153 @@ def filtrar_ativos(caminho: str) -> list[dict]:
     return resultado
 
 --- Exemplo 2 ---
-Pergunta: Como fazer retry automático em uma requisição HTTP com backoff exponencial?
+Pergunta: Retry automático em requisição HTTP com backoff exponencial.
 Resposta:
 import time
 import requests
 
 def get_com_retry(url: str, max_tentativas: int = 3) -> requests.Response:
-    for tentativa in range(max_tentativas):
+    for i in range(max_tentativas):
         try:
             resp = requests.get(url, timeout=10)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
-            if tentativa == max_tentativas - 1:
+            if i == max_tentativas - 1:
                 raise
-            espera = 2 ** tentativa
-            print(f"Tentativa {tentativa+1} falhou. Aguardando {espera}s...")
+            espera = 2 ** i
+            print(f"Tentativa {i+1} falhou. Aguardando {espera}s...")
             time.sleep(espera)
-
 ---
 """
 
-# ─────────────────────────────────────────────
-# CLIENTE OLLAMA
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# ANIMACAO DE PENSAMENTO
+# ─────────────────────────────────────────────────────────────
 
-def gerar(
-    prompt: str,
-    system: str = SYSTEM_GERAL,
+class Spinner:
+    """
+    Exibe animação de carregamento enquanto o modelo processa.
+    Roda em thread separada para não bloquear a chamada principal.
+    """
+    _QUADROS = [
+        "[          ]",
+        "[==        ]",
+        "[====      ]",
+        "[======    ]",
+        "[========  ]",
+        "[==========]",
+        "[  ========]",
+        "[    ======]",
+        "[      ====]",
+        "[        ==]",
+    ]
+
+    def __init__(self, mensagem: str = "Processando"):
+        self._msg   = mensagem
+        self._stop  = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self._QUADROS[i % len(self._QUADROS)]
+            print(f"\r  {frame}  {self._msg}...", end="", flush=True)
+            time.sleep(0.1)
+            i += 1
+
+    def atualizar(self, mensagem: str):
+        self._msg = mensagem
+
+    def iniciar(self):
+        self._thread.start()
+
+    def parar(self):
+        self._stop.set()
+        self._thread.join()
+        print(f"\r{' ' * 70}\r", end="", flush=True)
+
+# ─────────────────────────────────────────────────────────────
+# CLIENTE OLLAMA  —  /api/chat  (roles estruturados)
+# ─────────────────────────────────────────────────────────────
+
+def _chamar_ollama(
+    mensagens: list[dict],
+    system: str,
     temperature: float = 0.0,
-    stream: bool = True,
+    spinner: Spinner | None = None,
 ) -> str:
+    """
+    Chama POST /api/chat com roles user/assistant separados.
+    Usa stream=True internamente mas acumula o texto silenciosamente.
+    O spinner (se fornecido) é atualizado conforme etapas aparecem no stream.
+    """
     payload = {
-        "model":  MODELO,
-        "prompt": prompt,
-        "system": system,
+        "model":   MODELO,
+        "messages": [{"role": "system", "content": system}] + mensagens,
         "options": {
             "temperature": temperature,
-            "top_p": 0.95 if temperature > 0 else 1.0,
-            "num_predict": 8192,   # espaço para 30 etapas de raciocínio
+            "top_p":       0.95 if temperature > 0 else 1.0,
+            "num_predict": NUM_PREDICT,
         },
-        "stream": stream,
+        "stream": True,
     }
 
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT, stream=stream)
+        resp = requests.post(OLLAMA_CHAT, json=payload, timeout=TIMEOUT, stream=True)
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
-        print("\n[ERRO] Ollama não está rodando. Execute em outro terminal: ollama serve")
+        print("\n[ERRO] Ollama nao esta rodando. Execute em outro terminal: ollama serve")
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        print(f"\n[ERRO] Ollama retornou: {e}")
         sys.exit(1)
 
-    texto = ""
-    if stream:
-        for linha in resp.iter_lines():
-            if linha:
-                dados = json.loads(linha)
-                token = dados.get("response", "")
-                texto += token
-                print(token, end="", flush=True)
-                if dados.get("done"):
-                    break
-        print()
-    else:
-        texto = resp.json().get("response", "")
+    texto      = ""
+    etapa_atual = 0
+
+    for linha in resp.iter_lines():
+        if not linha:
+            continue
+        dados = json.loads(linha)
+        token = dados.get("message", {}).get("content", "")
+        texto += token
+
+        # Atualiza spinner com a etapa de raciocínio atual
+        if spinner:
+            m = re.search(r"ETAPA\s+(\d+)", texto)
+            if m:
+                n = int(m.group(1))
+                if n != etapa_atual:
+                    etapa_atual = n
+                    spinner.atualizar(f"Etapa {n}/30 do raciocínio")
+
+        if dados.get("done"):
+            break
 
     return texto
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # EXTRAÇÃO DE TAGS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
-def extrair_tag(texto: str, tag: str) -> str:
-    padrao = rf"<{tag}>(.*?)</{tag}>"
-    match = re.search(padrao, texto, re.DOTALL)
-    return match.group(1).strip() if match else ""
+def _tag(texto: str, nome: str) -> str:
+    m = re.search(rf"<{nome}>(.*?)</{nome}>", texto, re.DOTALL)
+    return m.group(1).strip() if m else ""
 
-def extrair_pensamento(texto: str) -> str:
-    """Extrai raciocínio de <think> (deepseek-r1 nativo) ou <thinking> (nosso prompt)."""
-    for tag in ("think", "thinking"):
-        resultado = extrair_tag(texto, tag)
-        if resultado:
-            return resultado
+def _pensamento(texto: str) -> str:
+    """Extrai raciocínio de <think> (deepseek nativo) ou <thinking> (nosso prompt)."""
+    for t in ("think", "thinking"):
+        r = _tag(texto, t)
+        if r:
+            return r
     return ""
 
-def extrair_resposta(texto: str) -> str:
-    """Extrai resposta de <answer>, ou texto após </think>/</thinking> se não houver tag."""
-    answer = extrair_tag(texto, "answer")
-    if answer:
-        return answer
-    # fallback: texto após o fechamento da tag de pensamento
+def _resposta(texto: str) -> str:
+    """Extrai resposta de <answer>, ou texto após o fechamento de thinking."""
+    ans = _tag(texto, "answer")
+    if ans:
+        return ans
     for fechamento in ("</think>", "</thinking>"):
         if fechamento in texto:
             parte = texto.split(fechamento, 1)[1].strip()
@@ -285,145 +339,154 @@ def extrair_resposta(texto: str) -> str:
                 return parte
     return texto.strip()
 
-def extrair_codigo(texto: str) -> str:
-    resposta = extrair_tag(texto, "answer") or texto
-    limpo = re.sub(r"```(?:python)?\n?(.*?)```", r"\1", resposta, flags=re.DOTALL)
-    return limpo.strip()
+def _codigo(texto: str) -> str:
+    base = _tag(texto, "answer") or texto
+    return re.sub(r"```(?:python)?\n?(.*?)```", r"\1", base, flags=re.DOTALL).strip()
 
-SEP = "─" * 56
+# ─────────────────────────────────────────────────────────────
+# EXIBIÇÃO FORMATADA
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# TÉCNICA 1: CoT PROFUNDO
-# ─────────────────────────────────────────────
-
-def perguntar_cot(pergunta: str, verbose: bool = True) -> str:
-    if verbose:
+def _exibir(pensamento: str, resposta: str, modo_nome: str, duracao: float, mostrar_pens: bool = True):
+    if pensamento and mostrar_pens:
         print(f"\n{SEP}")
-        print("  Raciocínio profundo em andamento...")
-        print(f"{SEP}\n")
-
-    resposta_bruta = gerar(pergunta, system=SYSTEM_GERAL, temperature=0.0)
-
-    pensamento = extrair_pensamento(resposta_bruta)
-    answer     = extrair_resposta(resposta_bruta)
-
-    if verbose and pensamento:
-        print(f"\n{SEP}")
-        print("  RACIOCÍNIO INTERNO")
+        print("  RACIOCINIO INTERNO")
         print(SEP)
-        # exibe o pensamento formatado, indentado
         for linha in pensamento.splitlines():
             print(f"  {linha}")
-        print(f"\n{SEP}")
-        print("  RESPOSTA FINAL")
-        print(f"{SEP}\n")
-        print(answer)
-        return answer
 
-    return answer if answer else resposta_bruta
+    print(f"\n{SEP}")
+    print("  RESPOSTA")
+    print(SEP)
+    print(resposta)
+    print(f"\n[{duracao:.1f}s | {modo_nome}]")
 
-# ─────────────────────────────────────────────
-# TÉCNICA 2: FEW-SHOT + CoT PARA CÓDIGO
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# MODOS DE RESPOSTA
+# ─────────────────────────────────────────────────────────────
 
-def gerar_codigo(pergunta: str, verbose: bool = True) -> str:
+def modo_cot(mensagens: list[dict]) -> tuple[str, str]:
+    """Modo 1 — Chain-of-Thought com 30 etapas obrigatórias."""
+    sp = Spinner("Iniciando raciocínio profundo")
+    sp.iniciar()
+    bruto = _chamar_ollama(mensagens, SYSTEM_COT, spinner=sp)
+    sp.parar()
+    return _resposta(bruto), _pensamento(bruto)
+
+
+def modo_codigo(mensagens: list[dict], verbose: bool = True) -> tuple[str, str]:
+    """Modo 2 — Few-shot + CoT para Python."""
     if verbose:
-        print("\n[Gerando codigo com exemplos de referencia...]\n")
+        print(f"\n  Gerando codigo com exemplos de referencia...\n")
 
-    prompt = f"{FEW_SHOT_CODIGO}\n--- Pergunta atual ---\n{pergunta}\nResposta:"
-    resposta = gerar(prompt, system=SYSTEM_CODIGO, temperature=0.0)
-    return extrair_codigo(resposta)
+    ultima = mensagens[-1]["content"]
+    msgs   = mensagens[:-1] + [{"role": "user", "content": f"{FEW_SHOT_CODIGO}\n---\n{ultima}"}]
+    bruto  = _chamar_ollama(msgs, SYSTEM_CODIGO)
+    return _codigo(bruto), _pensamento(bruto)
 
-# ─────────────────────────────────────────────
-# TÉCNICA 3: SELF-CONSISTENCY (VOTAÇÃO)
-# ─────────────────────────────────────────────
 
-def perguntar_com_voto(pergunta: str, n: int = SC_TENTATIVAS) -> str:
-    print(f"\n[Gerando {n} respostas e votando na melhor...]\n")
-
-    respostas = []
-    for i in range(n):
-        print(f"  Tentativa {i+1}/{n}...")
-        r = gerar(pergunta, system=SYSTEM_GERAL, temperature=0.7, stream=False)
-        answer = extrair_tag(r, "answer")
-        respostas.append(answer.strip())
-        print(f"  -> {answer.strip()[:80]}...")
-
-    mais_comum, votos = Counter(respostas).most_common(1)[0]
-    print(f"\nResposta com mais votos ({votos}/{n}):\n{mais_comum}\n")
-    return mais_comum
-
-# ─────────────────────────────────────────────
-# TÉCNICA 4: VERIFICADOR AUTOMÁTICO DE CÓDIGO
-# ─────────────────────────────────────────────
-
-def executar_codigo(codigo: str) -> tuple[bool, str]:
+def _executar_codigo(codigo: str) -> tuple[bool, str]:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
         f.write(codigo)
         caminho = f.name
-
     try:
-        resultado = subprocess.run(
-            [sys.executable, caminho],
-            capture_output=True, text=True, timeout=15
-        )
-        if resultado.returncode == 0:
-            return True, resultado.stdout
-        else:
-            return False, resultado.stderr
+        r = subprocess.run([sys.executable, caminho], capture_output=True, text=True, timeout=15)
+        return (r.returncode == 0), (r.stdout if r.returncode == 0 else r.stderr)
     except subprocess.TimeoutExpired:
         return False, "TIMEOUT: codigo demorou mais de 15 segundos"
     finally:
         Path(caminho).unlink(missing_ok=True)
 
-def gerar_e_verificar(pergunta: str) -> str:
-    print("\n[Gerando + testando codigo automaticamente...]\n")
 
-    codigo = gerar_codigo(pergunta, verbose=False)
+def modo_verificador(mensagens: list[dict]) -> tuple[str, str]:
+    """Modo 3 — Gera código, executa, autocorrige até MAX_FIX vezes."""
+    print(f"\n  Gerando e testando codigo automaticamente...\n")
 
-    for tentativa in range(MAX_CORRECOES + 1):
-        print(f"--- Codigo (tentativa {tentativa+1}) ---\n{codigo}\n")
+    codigo, pens = modo_codigo(mensagens, verbose=False)
 
-        sucesso, output = executar_codigo(codigo)
+    for tentativa in range(MAX_FIX + 1):
+        print(f"  --- Tentativa {tentativa + 1} ---")
+        print(codigo)
+        print()
 
-        if sucesso:
-            print(f"Codigo executou sem erros! Output: {output or '(sem output)'}")
-            return codigo
+        ok, output = _executar_codigo(codigo)
+        if ok:
+            print(f"  Codigo executou sem erros. Output: {output or '(sem output)'}")
+            return codigo, pens
 
-        print(f"Erro:\n{output}\n")
+        print(f"  Erro:\n{output}\n")
+        if tentativa < MAX_FIX:
+            print(f"  Pedindo correcao ({tentativa + 2}/{MAX_FIX + 1})...\n")
+            msgs_fix = mensagens + [
+                {"role": "assistant", "content": codigo},
+                {"role": "user",      "content": f"Erro ao executar:\n{output}\n\nCorrenja entre <answer></answer>."},
+            ]
+            bruto  = _chamar_ollama(msgs_fix, SYSTEM_CODIGO)
+            codigo = _codigo(bruto)
 
-        if tentativa < MAX_CORRECOES:
-            print(f"Pedindo autocorrecao ({tentativa+2}/{MAX_CORRECOES+1})...\n")
-            prompt_correcao = f"""O seguinte código Python tem um erro. Corrija-o.
+    print("  Nao foi possivel corrigir apos todas as tentativas.")
+    return codigo, pens
 
-Pergunta original: {pergunta}
 
-Código com erro:
-```python
-{codigo}
-```
+def modo_self_consistency(mensagens: list[dict]) -> tuple[str, str]:
+    """Modo 4 — Gera SC_N respostas independentes e vota na mais comum."""
+    print(f"\n  Gerando {SC_N} respostas e votando na melhor...\n")
 
-Erro:
-{output}
+    respostas = []
+    for i in range(SC_N):
+        sp = Spinner(f"Tentativa {i + 1}/{SC_N}")
+        sp.iniciar()
+        bruto = _chamar_ollama(mensagens, SYSTEM_COT, temperature=0.7)
+        sp.parar()
+        r = _resposta(bruto).strip()
+        respostas.append(r)
+        print(f"  [{i + 1}] {r[:100]}...")
 
-Código corrigido entre <answer> e </answer>."""
-            resposta = gerar(prompt_correcao, system=SYSTEM_CODIGO, temperature=0.0)
-            codigo = extrair_codigo(resposta)
+    mais_comum, votos = Counter(respostas).most_common(1)[0]
+    print(f"\n  Mais votada ({votos}/{SC_N}):\n")
+    return mais_comum, ""
 
-    print("Nao foi possivel corrigir apos todas as tentativas.")
-    return codigo
 
-# ─────────────────────────────────────────────
-# TÉCNICA 5: RAG LOCAL (OPCIONAL)
-# ─────────────────────────────────────────────
+def modo_adaptativo(mensagens: list[dict], perfil: dict) -> tuple[str, str]:
+    """Modo 6 — Adapta resposta ao perfil detectado do usuário."""
+    linhas_perfil = "\n".join(f"- {k}: {v}" for k, v in perfil.items())
+    if not linhas_perfil:
+        linhas_perfil = "- Perfil ainda sendo construído. Adapte-se com base nesta mensagem."
+
+    system = SYSTEM_ADAPTATIVO.format(perfil=linhas_perfil)
+
+    sp = Spinner("Analisando perfil e adaptando resposta")
+    sp.iniciar()
+    bruto = _chamar_ollama(mensagens, system, temperature=0.1)
+    sp.parar()
+    return _resposta(bruto), _pensamento(bruto)
+
+
+def modo_compacto(mensagens: list[dict]) -> tuple[str, str]:
+    """Modo 7 — Resposta curta e direta, sem raciocínio visível."""
+    bruto = _chamar_ollama(mensagens, SYSTEM_COMPACTO)
+    return _resposta(bruto), ""
+
+
+def modo_ultra(mensagens: list[dict]) -> tuple[str, str]:
+    """Modo 8 — 30 etapas + perspectiva alternativa + síntese final."""
+    sp = Spinner("Ultra-pensamento ativo (pode demorar 2-4 min)")
+    sp.iniciar()
+    bruto = _chamar_ollama(mensagens, SYSTEM_ULTRA, spinner=sp)
+    sp.parar()
+    return _resposta(bruto), _pensamento(bruto)
+
+# ─────────────────────────────────────────────────────────────
+# RAG LOCAL (modo 5)
+# ─────────────────────────────────────────────────────────────
 
 class RAGLocal:
     def __init__(self, pasta: Path = PASTA_DOCS):
-        self.pasta = pasta
+        self.pasta      = pasta
         self.disponivel = False
-        self._inicializar()
+        self._init()
 
-    def _inicializar(self):
+    def _init(self):
         try:
             import chromadb
             from sentence_transformers import SentenceTransformer
@@ -431,198 +494,261 @@ class RAGLocal:
             self.client  = chromadb.Client()
             self.colecao = self.client.get_or_create_collection("docs_locais")
             self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
-            self._indexar_docs()
+            self._indexar()
             self.disponivel = True
-            print(f"RAG inicializado com {self.colecao.count()} chunks.")
+            print(f"  RAG inicializado: {self.colecao.count()} chunks indexados.")
         except ImportError:
-            print("RAG desativado. Instale: pip install chromadb sentence-transformers")
+            print("  RAG desativado. Instale: pip install chromadb sentence-transformers")
         except Exception as e:
-            print(f"RAG desativado: {e}")
+            print(f"  RAG desativado: {e}")
 
-    def _indexar_docs(self):
+    def _indexar(self):
         if not self.pasta.exists():
             self.pasta.mkdir(exist_ok=True)
             return
         arquivos = list(self.pasta.glob("**/*.txt")) + list(self.pasta.glob("**/*.py"))
-        for arquivo in arquivos:
-            texto = arquivo.read_text(encoding="utf-8", errors="ignore")
-            chunks = [texto[i:i+500] for i in range(0, len(texto), 400)]
+        for arq in arquivos:
+            texto  = arq.read_text(encoding="utf-8", errors="ignore")
+            chunks = [texto[i:i + 500] for i in range(0, len(texto), 400)]
             for j, chunk in enumerate(chunks):
                 self.colecao.add(
                     documents=[chunk],
-                    ids=[f"{arquivo.stem}_{j}"],
-                    metadatas=[{"fonte": str(arquivo)}]
+                    ids=[f"{arq.stem}_{j}"],
+                    metadatas=[{"fonte": str(arq)}],
                 )
 
-    def buscar(self, pergunta: str, n: int = 3) -> str:
+    def _buscar(self, pergunta: str, n: int = 3) -> str:
         if not self.disponivel or self.colecao.count() == 0:
             return ""
-        resultados = self.colecao.query(query_texts=[pergunta], n_results=n)
-        docs = resultados.get("documents", [[]])[0]
+        docs = self.colecao.query(query_texts=[pergunta], n_results=n).get("documents", [[]])[0]
         return "\n\n---\n\n".join(docs)
 
-    def perguntar(self, pergunta: str) -> str:
-        contexto = self.buscar(pergunta)
+    def perguntar(self, mensagens: list[dict]) -> tuple[str, str]:
+        pergunta  = mensagens[-1]["content"]
+        contexto  = self._buscar(pergunta)
+
         if contexto:
-            print(f"\n[RAG] {len(contexto)} chars de contexto injetados.\n")
-            prompt = f"""Use APENAS o contexto abaixo para responder. Se não tiver a informação, diga que não encontrou.
-
-CONTEXTO:
-{contexto}
-
-PERGUNTA:
-{pergunta}"""
+            print(f"\n  RAG: {len(contexto)} chars de contexto injetados.\n")
+            msgs = mensagens[:-1] + [{
+                "role":    "user",
+                "content": f"CONTEXTO:\n{contexto}\n\nPERGUNTA:\n{pergunta}",
+            }]
         else:
-            prompt = pergunta
-        return perguntar_cot(prompt)
+            msgs = mensagens
 
-# ─────────────────────────────────────────────
-# MEMÓRIA DE CONVERSA
-# ─────────────────────────────────────────────
+        sp = Spinner("Consultando documentos")
+        sp.iniciar()
+        bruto = _chamar_ollama(msgs, SYSTEM_COT)
+        sp.parar()
+        return _resposta(bruto), _pensamento(bruto)
 
-class MemoriaConversa:
+# ─────────────────────────────────────────────────────────────
+# MEMORIA DE CONVERSA
+# ─────────────────────────────────────────────────────────────
+
+class Memoria:
+    """
+    Mantém histórico como lista de {"role", "content"} para /api/chat.
+    Compatível com formato antigo ({"papel", "conteudo"}).
+    """
+
     def __init__(self, arquivo: str = "memoria_chat.json"):
-        self.arquivo = Path(arquivo)
-        self.historico: list[dict] = self._carregar()
+        self.arquivo   = Path(arquivo)
+        self.msgs: list[dict] = self._carregar()
+        self.perfil: dict     = {}
 
     def _carregar(self) -> list:
-        if self.arquivo.exists():
-            with open(self.arquivo, encoding="utf-8") as f:
-                return json.load(f)
-        return []
+        if not self.arquivo.exists():
+            return []
+        try:
+            dados = json.loads(self.arquivo.read_text(encoding="utf-8"))
+            if dados and "papel" in dados[0]:
+                # migra formato antigo
+                return [
+                    {"role": "user" if m["papel"] == "user" else "assistant",
+                     "content": m["conteudo"]}
+                    for m in dados
+                ]
+            return dados
+        except Exception:
+            return []
 
     def salvar(self):
-        with open(self.arquivo, "w", encoding="utf-8") as f:
-            json.dump(self.historico, f, ensure_ascii=False, indent=2)
+        self.arquivo.write_text(
+            json.dumps(self.msgs, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    def adicionar(self, papel: str, conteudo: str):
-        self.historico.append({
-            "papel": papel,
-            "conteudo": conteudo,
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        })
+    def add(self, role: str, content: str):
+        self.msgs.append({"role": role, "content": content})
         self.salvar()
 
-    def formatar_para_prompt(self, max_turnos: int = 6) -> str:
-        recentes = self.historico[-(max_turnos * 2):]
-        if not recentes:
-            return ""
-        linhas = []
-        for msg in recentes:
-            papel = "Usuario" if msg["papel"] == "user" else "Assistente"
-            linhas.append(f"{papel}: {msg['conteudo']}")
-        return "\n".join(linhas)
+    def historico(self, max_turnos: int = 10) -> list[dict]:
+        """Retorna últimos N turnos para passar ao /api/chat."""
+        return self.msgs[-(max_turnos * 2):]
+
+    def atualizar_perfil(self, chave: str, valor: str):
+        self.perfil[chave] = valor
 
     def limpar(self):
-        self.historico = []
+        self.msgs  = []
+        self.perfil = {}
         self.salvar()
-        print("Memoria limpa.")
+        print("  Memoria limpa.")
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# DETECÇÃO DE PREFERÊNCIAS (modo adaptativo)
+# ─────────────────────────────────────────────────────────────
+
+def _atualizar_perfil(pergunta: str, memoria: Memoria):
+    p = pergunta.lower()
+
+    if any(w in p for w in ["código", "python", "função", "script", "bug", "erro", "api"]):
+        memoria.atualizar_perfil("area", "desenvolvimento de software")
+
+    if len(pergunta.split()) <= 4:
+        memoria.atualizar_perfil("estilo", "mensagens curtas e diretas")
+    elif len(pergunta.split()) >= 20:
+        memoria.atualizar_perfil("estilo", "mensagens detalhadas e elaboradas")
+
+    if any(p.startswith(w) for w in ["nao use", "pare de", "sem ", "nao quero"]):
+        prefs = memoria.perfil.get("preferencias", "")
+        memoria.atualizar_perfil("preferencias", f"{prefs}; {pergunta}".strip("; "))
+
+# ─────────────────────────────────────────────────────────────
 # INTERFACE DE CHAT
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 MODOS = {
-    "1": ("Conversa geral (CoT)",    "perguntas gerais, chat, explicacoes"),
-    "2": ("Codigo + few-shot",       "geracao de codigo Python"),
-    "3": ("Codigo + verificador",    "codigo testado automaticamente"),
-    "4": ("Self-consistency",        "respostas objetivas com votacao"),
-    "5": ("RAG local",               "usa arquivos da pasta ./docs/"),
+    "1": ("CoT profundo",        "30 etapas de raciocínio antes da resposta"),
+    "2": ("Codigo + few-shot",   "gera código Python com exemplos de referência"),
+    "3": ("Codigo + verif.",     "gera, executa e autocorrige o código"),
+    "4": ("Self-consistency",    "3 respostas independentes, vota na melhor"),
+    "5": ("RAG local",           "usa documentos da pasta ./docs/"),
+    "6": ("Adaptativo",          "aprende e adapta ao seu perfil de comunicação"),
+    "7": ("Compacto",            "respostas curtas e diretas, sem raciocínio"),
+    "8": ("Ultra-pensamento",    "30 etapas + 2ª perspectiva + síntese"),
 }
 
-def menu_modo() -> str:
-    print("\n+-- Modo de resposta ---------------------------")
+
+def _menu_modo() -> str:
+    print(f"\n+-- Modo de resposta {'─' * 36}")
     for k, (nome, desc) in MODOS.items():
-        print(f"|  [{k}] {nome:<28} {desc}")
-    print("+-----------------------------------------------")
+        print(f"|  [{k}] {nome:<22} {desc}")
+    print(f"+{'─' * 58}")
     escolha = input("Modo [1]: ").strip() or "1"
     return escolha if escolha in MODOS else "1"
 
-def chat():
-    print("=" * 56)
-    print(f"  Motor IA Avancado  |  Modelo: {MODELO}")
-    print("=" * 56)
-    print("Comandos: 'modo' muda tecnica | 'limpar' reseta memoria")
-    print("          'memoria' ve historico | 'sair' encerra\n")
 
-    memoria = MemoriaConversa()
-    rag     = None   # inicializado só quando modo 5 for selecionado
+def chat():
+    print("=" * 58)
+    print(f"  Motor IA Avancado  |  Modelo: {MODELO}")
+    print("=" * 58)
+    print("  Comandos: 'modo' | 'limpar' | 'memoria' | 'perfil' | 'sair'")
+    print(f"  Modos: {' | '.join(f'{k}={v[0]}' for k, v in MODOS.items())}\n")
+
+    memoria = Memoria()
+    rag     = None
     modo    = "1"
 
     while True:
         try:
-            pergunta = input("Voce: ").strip()
+            entrada = input("Voce: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando...")
             break
 
-        if not pergunta:
+        if not entrada:
             continue
 
-        if pergunta.lower() == "sair":
-            break
-        if pergunta.lower() == "modo":
-            modo = menu_modo()
-            print(f"Modo: {MODOS[modo][0]}")
-            continue
-        if pergunta.lower() == "limpar":
-            memoria.limpar()
-            continue
-        if pergunta.lower() == "memoria":
-            print("\n-- Historico --")
-            print(memoria.formatar_para_prompt(max_turnos=10) or "(vazio)")
-            print("---------------")
-            continue
+        match entrada.lower():
+            case "sair":
+                break
+            case "modo":
+                modo = _menu_modo()
+                print(f"  Modo: {MODOS[modo][0]}")
+                continue
+            case "limpar":
+                memoria.limpar()
+                continue
+            case "memoria":
+                msgs = memoria.historico()
+                print(f"\n  -- Historico ({len(msgs)} mensagens) --")
+                for m in msgs:
+                    print(f"  [{m['role']:9}] {m['content'][:100]}")
+                print("  ---")
+                continue
+            case "perfil":
+                print("\n  -- Perfil detectado --")
+                if memoria.perfil:
+                    for k, v in memoria.perfil.items():
+                        print(f"  {k}: {v}")
+                else:
+                    print("  (ainda vazio)")
+                print("  ---")
+                continue
 
-        contexto_memoria = memoria.formatar_para_prompt()
-        if contexto_memoria:
-            prompt_final = f"Historico recente:\n{contexto_memoria}\n\nNova mensagem: {pergunta}"
-        else:
-            prompt_final = pergunta
+        # Monta histórico + nova mensagem para o /api/chat
+        mensagens = memoria.historico() + [{"role": "user", "content": entrada}]
 
         print()
-        inicio = time.time()
+        inicio     = time.time()
+        pensamento = ""
 
-        if modo == "1":
-            resposta = perguntar_cot(prompt_final)
-        elif modo == "2":
-            resposta = gerar_codigo(prompt_final)
-        elif modo == "3":
-            resposta = gerar_e_verificar(prompt_final)
-        elif modo == "4":
-            resposta = perguntar_com_voto(prompt_final)
-        elif modo == "5":
-            if rag is None:
-                print("Inicializando RAG (pode demorar na primeira vez)...")
-                rag = RAGLocal()
-            resposta = rag.perguntar(prompt_final)
+        match modo:
+            case "1":
+                resposta, pensamento = modo_cot(mensagens)
+            case "2":
+                resposta, pensamento = modo_codigo(mensagens)
+            case "3":
+                resposta, pensamento = modo_verificador(mensagens)
+            case "4":
+                resposta, pensamento = modo_self_consistency(mensagens)
+            case "5":
+                if rag is None:
+                    print("  Inicializando RAG (primeira vez pode demorar)...")
+                    rag = RAGLocal()
+                resposta, pensamento = rag.perguntar(mensagens)
+            case "6":
+                resposta, pensamento = modo_adaptativo(mensagens, memoria.perfil)
+            case "7":
+                resposta, pensamento = modo_compacto(mensagens)
+            case "8":
+                resposta, pensamento = modo_ultra(mensagens)
+            case _:
+                resposta, pensamento = modo_cot(mensagens)
 
-        duracao = time.time() - inicio
-        print(f"\n[{duracao:.1f}s | {MODOS[modo][0]}]")
+        duracao     = time.time() - inicio
+        nome_modo   = MODOS[modo][0]
+        ocultar_pen = modo == "7"   # compacto não exibe raciocínio
 
-        memoria.adicionar("user", pergunta)
-        memoria.adicionar("assistant", resposta)
+        _exibir(pensamento, resposta, nome_modo, duracao, mostrar_pens=not ocultar_pen)
 
-# ─────────────────────────────────────────────
+        # Atualiza perfil para modo adaptativo
+        _atualizar_perfil(entrada, memoria)
+
+        # Persiste no histórico
+        memoria.add("user",      entrada)
+        memoria.add("assistant", resposta)
+
+# ─────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
-        modelos_disponiveis = [m["name"] for m in r.json().get("models", [])]
-        modelo_base = MODELO.split(":")[0]
-        if not any(modelo_base in m for m in modelos_disponiveis):
-            print(f"Modelo '{MODELO}' nao encontrado.")
-            print(f"Execute: ollama pull {MODELO}")
-            if modelos_disponiveis:
-                print(f"Modelos disponiveis: {modelos_disponiveis}")
-            else:
-                print("Nenhum modelo instalado ainda.")
+        r = requests.get(OLLAMA_TAGS, timeout=3)
+        modelos = [m["name"] for m in r.json().get("models", [])]
+        base    = MODELO.split(":")[0]
+        if not any(base in m for m in modelos):
+            print(f"  Modelo '{MODELO}' nao encontrado.")
+            print(f"  Execute: ollama pull {MODELO}")
+            if modelos:
+                print(f"  Disponiveis: {modelos}")
             sys.exit(1)
     except requests.exceptions.ConnectionError:
-        print("[ERRO] Ollama nao esta rodando.")
-        print("   Execute em outro terminal: ollama serve")
+        print("  [ERRO] Ollama nao esta rodando.")
+        print("  Execute em outro terminal: ollama serve")
         sys.exit(1)
 
     chat()
