@@ -1095,13 +1095,17 @@ def chat():
 
         duracao   = time.time() - inicio
         nome_modo = MODOS[modo][0]
-        modelo_label = f"{modelo_selecionado} | " if modelo_selecionado != MODELO else ""
 
         _exibir(pensamento, resposta, nome_modo, duracao, mostrar_pens=(modo != "7"))
-        print(f"  [modelo: {modelo_label}{nome_modo}]")
+        print(f"  [modelo: {modelo_selecionado} | {nome_modo}]")
 
-        # Extrai fatos da troca e salva no banco automaticamente
-        _extrair_e_salvar(entrada, resposta, banco)
+        # Extrai fatos em background (não bloqueia o próximo input)
+        t = threading.Thread(
+            target=_extrair_e_salvar,
+            args=(entrada, resposta, banco),
+            daemon=True,
+        )
+        t.start()
 
         # Atualiza perfil para modo adaptativo
         _atualizar_perfil(entrada, memoria)

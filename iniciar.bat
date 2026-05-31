@@ -13,7 +13,8 @@ rem KV Cache em quantização q8_0 — economiza ~20%% de VRAM
 rem Verifique suporte: ollama --version >= 0.3.0
 rem set OLLAMA_KV_CACHE_TYPE=q8_0
 
-rem ── Ambiente virtual e execução ──────────────────────────
+rem ── Encoding e ambiente virtual ─────────────────────────
+set PYTHONIOENCODING=utf-8
 call venv_cuda\Scripts\activate.bat
 python main.py
 pause
