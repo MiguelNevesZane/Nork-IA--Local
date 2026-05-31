@@ -707,12 +707,6 @@ def _borda_topo() -> str:
 def _borda_meio() -> str:
     return f"+{'-'*(_CL+2)}+{'-'*(_CR+2)}+"
 
-def _borda_secao() -> str:
-    return f"+{'='*(_CL+2)}+{'='*(_CR+2)}+"
-
-def _borda_fim() -> str:
-    return f"+{'='*(_CL+2)}+{'='*(_CR+2)}+"
-
 def _linha_colunas(esq: str = "", dir_: str = "") -> str:
     return f"| {esq:<{_CL}} | {dir_:<{_CR}} |"
 
@@ -720,9 +714,6 @@ def _linha_titulo(titulo: str) -> str:
     return f"|{titulo.center(_TW)}|"
 
 def _borda_topo_simples() -> str:
-    return f"+{'='*_TW}+"
-
-def _borda_fim_simples() -> str:
     return f"+{'='*_TW}+"
 
 
@@ -767,7 +758,7 @@ def _exibir_header(modo: str):
     ]
     for cmd, desc in banco_cmds:
         print(_linha_colunas(f"  {cmd}", f"  -> {desc}"))
-    print(_borda_fim())
+    print(_borda_topo())
     print()
 
 
@@ -775,13 +766,13 @@ def _menu_modo(modo_atual: str) -> str:
     print()
     print(_borda_topo_simples())
     print(_linha_titulo("  ESCOLHA O MODO DE RESPOSTA  "))
-    print(_borda_meio() if False else f"╠{'═'*(_CL+_CR+5)}╣")
+    print(f"╠{'═'*(_CL+_CR+5)}╣")
     for k, (nome, desc) in MODOS.items():
         ativo = " *" if k == modo_atual else "  "
         linha = f"{ativo}[{k}]  {nome:<18}  {desc}"
         total = _CL + _CR + 5
         print(f"║{linha:<{total}}║")
-    print(_borda_fim_simples())
+    print(_borda_topo_simples())
     escolha = input("  Modo [Enter = manter atual]: ").strip() or modo_atual
     return escolha if escolha in MODOS else modo_atual
 
