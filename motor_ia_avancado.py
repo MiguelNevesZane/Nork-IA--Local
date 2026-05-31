@@ -959,7 +959,7 @@ def chat():
 
     while True:
         try:
-            entrada = input("Voce: ").strip()
+            entrada = input("Voce: ").strip().lstrip("﻿")  # remove BOM se presente
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando...")
             break
@@ -967,7 +967,7 @@ def chat():
         if not entrada:
             continue
 
-        cmd = entrada.lower().strip()
+        cmd = entrada.lower().strip().lstrip("﻿")
 
         # ── Comandos exatos ─────────────────────────────────
         if cmd == "sair":
