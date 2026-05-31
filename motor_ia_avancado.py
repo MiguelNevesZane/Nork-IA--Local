@@ -35,7 +35,11 @@ import requests
 
 import sandbox as _sandbox
 from banco_memoria import BancoMemoria
-from roteador_modelos import rotear as _rotear, temperatura_para_modo as _temp_modo
+from roteador_modelos import (
+    rotear as _rotear,
+    rotear_inteligente as _rotear_inteligente,
+    temperatura_para_modelo as _temp_modelo,
+)
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
@@ -275,6 +279,7 @@ def _chamar_ollama(
     temperature: float = 0.0,
     spinner: Spinner | None = None,
     modelo: str | None = None,
+    num_predict: int | None = None,
 ) -> str:
     """
     Chama POST /api/chat com roles user/assistant separados.
@@ -282,7 +287,8 @@ def _chamar_ollama(
     O spinner (se fornecido) é atualizado conforme etapas aparecem no stream.
 
     Args:
-        modelo: sobrescreve MODELO global (roteador passa o modelo selecionado).
+        modelo:      sobrescreve MODELO global (roteador passa o modelo selecionado).
+        num_predict: sobrescreve NUM_PREDICT (usado pelo roteador inteligente).
     """
     modelo_uso = modelo or MODELO
     payload = {
@@ -292,7 +298,7 @@ def _chamar_ollama(
         "options": {
             "temperature": temperature,
             "top_p":       0.95 if temperature > 0 else 1.0,
-            "num_predict": NUM_PREDICT,
+            "num_predict": num_predict if num_predict is not None else NUM_PREDICT,
             "num_ctx":     NUM_CTX,
         },
         "stream": True,
@@ -1043,8 +1049,16 @@ def chat():
         mensagens_base = memoria.historico() + [{"role": "user", "content": entrada}]
         mensagens      = _injetar_memorias(mensagens_base, banco)
 
-        # Seleciona modelo via roteador
-        modelo_selecionado, _ = _rotear(entrada, modo, _modelos_disp)
+        # Roteador inteligente: modelo de decisão lê mensagem + contexto
+        ctx_banco_preview = banco.formatar_contexto(entrada) if banco.disponivel else ""
+        modelo_selecionado, motivo_roteamento = _rotear_inteligente(
+            entrada,
+            modo,
+            memoria.historico(max_turnos=3),
+            _modelos_disp,
+            ctx_banco_preview,
+        )
+        print(f"\n  [roteador] {modelo_selecionado} -- {motivo_roteamento}")
 
         print()
         inicio     = time.time()
